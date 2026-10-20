@@ -56,8 +56,10 @@ std::string arch_problem(const cudaDeviceProp& p, int ordinal) {
                "); compile it for this card (./maya.sh --backend hip, or -DCMAKE_HIP_ARCHITECTURES=" + arch +
                ", docs/AMD_MAYA.md) or choose another GPU with HIP_VISIBLE_DEVICES";
     }
-    if (p.warpSize != 32) {
-        return card + " runs wave" + std::to_string(p.warpSize) + "; Maya's HIP kernels need wave32";
+    const int required_wave = (arch == "gfx906") ? 64 : 32;
+    if (p.warpSize != required_wave) {
+        return card + " runs wave" + std::to_string(p.warpSize) + "; this build expects wave" +
+               std::to_string(required_wave) + " for " + arch;
     }
     return "";
 }

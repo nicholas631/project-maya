@@ -138,7 +138,15 @@ __device__ __forceinline__ T shfl_sync(uint32_t mask, T value, int source_lane, 
 
 __device__ __forceinline__ unsigned ballot_sync(uint32_t mask, int predicate) {
     require_full_wave_mask(mask);
-    return static_cast<unsigned>(__ballot(predicate));
+    const unsigned long long ballot = __ballot(predicate);
+#if defined(STRATA_GFX906_WAVE64)
+    // CUDA's 0xffffffff mask describes one logical warp32. On gfx906 the hardware
+    // ballot spans a 64-lane wave, so extract the half containing this lane before
+    // exposing the CUDA-compatible 32-bit result.
+    return static_cast<unsigned>((ballot >> (__lane_id() & 32u)) & mask);
+#else
+    return static_cast<unsigned>(ballot) & mask;
+#endif
 }
 
 }  // namespace strata::hip_compat
