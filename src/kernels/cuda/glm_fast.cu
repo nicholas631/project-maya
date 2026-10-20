@@ -743,6 +743,17 @@ template<> __device__ __forceinline__ float dw<19>(const uint8_t* row, int kbx, 
     const float delta = -1.0f + IQ1S_DELTA - (qh & 0x8000) * (2.0f * IQ1S_DELTA / 0x8000);
     return d1q * (x.d * sumi + x.s * delta);
 }
+#if defined(STRATA_USE_HIP)
+// Fast bit-parallel sign expansion for HIP (gfx906/gfx11/gfx12) where __vcmpne4/__vsub4 are software-emulated.
+// Every IQ2/IQ3 grid byte is nonzero and <= 62, so two's-complement negation uses a whole-word add without carries.
+__device__ __forceinline__ uint4 hip_fast_signs(unsigned b, bool parity) {
+    b &= parity ? 127u : 255u;
+    if (parity) b |= (__popc(b) & 1u) << 7;
+    const unsigned lo = (((b & 15u) * 0x10204080u) & 0x80808080u) >> 7;
+    const unsigned hi = ((((b >> 4) & 15u) * 0x10204080u) & 0x80808080u) >> 7;
+    return make_uint4(lo * 255u, lo, hi * 255u, hi);
+}
+#endif
 template<> __device__ __forceinline__ float dw<16>(const uint8_t* row, int kbx, int iqs, const XV& x, const uint32_t* tab) {
     const block_iq2_xxs* bq2 = (const block_iq2_xxs*) row + kbx;
     const int q2 = get_int_b2(bq2->qs, iqs);
@@ -752,11 +763,17 @@ template<> __device__ __forceinline__ float dw<16>(const uint8_t* row, int kbx, 
 #pragma unroll
     for (int k0 = 0; k0 < 8; k0 += 2) {
         const uint2 grid_pos = ((const uint2*) tab)[aux8[k0 / 2]];
+#if defined(STRATA_USE_HIP)
+        const uint4 sgn = hip_fast_signs(aux32 >> (7 * k0 / 2), true);
+        sumi = __dp4a((int) ((grid_pos.x ^ sgn.x) + sgn.y), x.u[k0 + 0], sumi);
+        sumi = __dp4a((int) ((grid_pos.y ^ sgn.z) + sgn.w), x.u[k0 + 1], sumi);
+#else
         const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
         const int signs0 = __vcmpne4(signs & 0x08040201, 0);
         sumi = __dp4a((int) __vsub4(grid_pos.x ^ signs0, signs0), x.u[k0 + 0], sumi);
         const int signs1 = __vcmpne4(signs & 0x80402010, 0);
         sumi = __dp4a((int) __vsub4(grid_pos.y ^ signs1, signs1), x.u[k0 + 1], sumi);
+#endif
     }
     const int ls = aux32 >> 27 | 1;
     sumi = sumi * ls / 8;
@@ -771,11 +788,17 @@ template<> __device__ __forceinline__ float dw<18>(const uint8_t* row, int kbx, 
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int2 grid_pos = make_int2(tab[q3[l0 + 0]], tab[q3[l0 + 1]]);
+#if defined(STRATA_USE_HIP)
+        const uint4 sgn = hip_fast_signs(aux32 >> (7 * l0 / 2), true);
+        sumi = __dp4a((int) ((grid_pos.x ^ sgn.x) + sgn.y), x.u[l0 + 0], sumi);
+        sumi = __dp4a((int) ((grid_pos.y ^ sgn.z) + sgn.w), x.u[l0 + 1], sumi);
+#else
         const uint32_t signs = unpack_ksigns(aux32 >> (7 * l0 / 2));
         const int signs0 = __vcmpne4(signs & 0x08040201, 0);
         const int signs1 = __vcmpne4(signs & 0x80402010, 0);
         sumi = __dp4a((int) __vsub4(grid_pos.x ^ signs0, signs0), x.u[l0 + 0], sumi);
         sumi = __dp4a((int) __vsub4(grid_pos.y ^ signs1, signs1), x.u[l0 + 1], sumi);
+#endif
     }
     const int ls = aux32 >> 28;
     sumi = (ls * sumi + sumi / 2) / 2;
@@ -807,11 +830,17 @@ template<> __device__ __forceinline__ float dw<17>(const uint8_t* row, int kbx, 
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const uint2 grid_pos = ((const uint2*) tab)[q2[l0 / 2] & 0x1FF];
+#if defined(STRATA_USE_HIP)
+        const uint4 sgn = hip_fast_signs(q2[l0 / 2] >> 9, true);
+        const int grid_l = (int) ((grid_pos.x ^ sgn.x) + sgn.y);
+        const int grid_h = (int) ((grid_pos.y ^ sgn.z) + sgn.w);
+#else
         const uint32_t signs = unpack_ksigns(q2[l0 / 2] >> 9);
         const int signs0 = __vcmpne4(signs & 0x08040201, 0);
         const int signs1 = __vcmpne4(signs & 0x80402010, 0);
         const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
         const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+#endif
         if (l0 < 4) {
             sumi0 = __dp4a(grid_l, x.u[l0 + 0], sumi0);
             sumi0 = __dp4a(grid_h, x.u[l0 + 1], sumi0);
@@ -836,12 +865,18 @@ template<> __device__ __forceinline__ float dw<22>(const uint8_t* row, int kbx, 
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const uint2 grid_pos = ((const uint2*) tab)[qs[l0 / 2] | ((qh << (8 - l0)) & 0x300)];
+#if defined(STRATA_USE_HIP)
+        const uint4 sgn = hip_fast_signs(signs_packed_8[l0 / 2], false);
+        const int grid_l = (int) ((grid_pos.x ^ sgn.x) + sgn.y);
+        const int grid_h = (int) ((grid_pos.y ^ sgn.z) + sgn.w);
+#else
         const int signs0 =
             __vcmpne4(((signs_packed_8[l0 / 2] & 0x03) << 7) | ((signs_packed_8[l0 / 2] & 0x0C) << 21), 0x00000000);
         const int signs1 =
             __vcmpne4(((signs_packed_8[l0 / 2] & 0x30) << 3) | ((signs_packed_8[l0 / 2] & 0xC0) << 17), 0x00000000);
         const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
         const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+#endif
         if (l0 < 4) {
             sumi0 = __dp4a(grid_l, x.u[l0 + 0], sumi0);
             sumi0 = __dp4a(grid_h, x.u[l0 + 1], sumi0);
@@ -864,12 +899,18 @@ template<> __device__ __forceinline__ float dw<21>(const uint8_t* row, int kbx, 
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int2 grid_pos = make_int2(tab[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)], tab[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
+#if defined(STRATA_USE_HIP)
+        const uint4 sgn = hip_fast_signs(signs_packed_8[l0 / 2], false);
+        const int grid_l = (int) ((grid_pos.x ^ sgn.x) + sgn.y);
+        const int grid_h = (int) ((grid_pos.y ^ sgn.z) + sgn.w);
+#else
         const int signs0 =
             __vcmpne4(((signs_packed_8[l0 / 2] & 0x03) << 7) | ((signs_packed_8[l0 / 2] & 0x0C) << 21), 0x00000000);
         const int signs1 =
             __vcmpne4(((signs_packed_8[l0 / 2] & 0x30) << 3) | ((signs_packed_8[l0 / 2] & 0xC0) << 17), 0x00000000);
         const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
         const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+#endif
         sumi = __dp4a(grid_l, x.u[l0 + 0], sumi);
         sumi = __dp4a(grid_h, x.u[l0 + 1], sumi);
     }
@@ -4756,7 +4797,7 @@ std::atomic<int> g_mv_r{-1}, g_mv_u{2}, g_mv_wpb{8}, g_mv_lds{-1};
 // latency the in-flight loads hide; STRATA_GLM_MV_RDNA=1 on any gfx11 (an RX 7900's GDDR6: not measured yet),
 // STRATA_GLM_MV_RDNA=0 keeps mv_kernel_t and the generic kernel (A/B)
 bool mv_rdna_device() {
-    static const int mode = [] {   // -1: default, 0: off, 1: every gfx11
+    static const int mode = [] {   // -1: default (gfx115x + gfx120x), 0: off, 1: every gfx11/gfx12
         const char* v = std::getenv("STRATA_GLM_MV_RDNA");
         return v == nullptr ? -1 : v[0] == '0' ? 0 : 1;
     }();
@@ -4768,7 +4809,8 @@ bool mv_rdna_device() {
     if (cached_device != device) {
         hipDeviceProp_t prop{};
         if (hipGetDeviceProperties(&prop, device) != hipSuccess) return false;
-        on = std::strncmp(prop.gcnArchName, mode > 0 ? "gfx11" : "gfx115", mode > 0 ? 5 : 6) == 0;
+        on = std::strncmp(prop.gcnArchName, mode > 0 ? "gfx11" : "gfx115", mode > 0 ? 5 : 6) == 0 ||
+             std::strncmp(prop.gcnArchName, "gfx12", 5) == 0;
         cached_device = device;
     }
     return on;
@@ -5577,14 +5619,16 @@ bool rdna3_expert_device(bool allow_gfx1151 = true) {
     static thread_local int cached_device = -1;
     static thread_local bool gfx1100 = false;
     static thread_local bool gfx1151 = false;
+    static thread_local bool gfx120x = false;
     if (cached_device != device) {
         hipDeviceProp_t prop{};
         if (hipGetDeviceProperties(&prop, device) != hipSuccess) return false;
         gfx1100 = std::strncmp(prop.gcnArchName, "gfx1100", 7) == 0;
         gfx1151 = std::strncmp(prop.gcnArchName, "gfx1151", 7) == 0;
+        gfx120x = std::strncmp(prop.gcnArchName, "gfx120", 6) == 0;
         cached_device = device;
     }
-    return gfx1100 || (allow_gfx1151 && gfx1151);
+    return gfx1100 || gfx120x || (allow_gfx1151 && gfx1151);
 }
 // Splitting shared down removes its dynamic type switch from routed gate/up's
 // register budget. The routed grid keeps exactly the original dot/reduction order.

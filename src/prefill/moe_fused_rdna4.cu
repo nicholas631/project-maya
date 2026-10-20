@@ -648,8 +648,11 @@ DeviceInfo device_info() {
     d.ready = true;
     cudaDeviceProp prop{};
     ck(cudaGetDeviceProperties(&prop, dev), "properties");
-    // Other compiled architectures retain MMQ until measured and validated separately.
-    if (std::strncmp(prop.gcnArchName, "gfx1151", 7)) return d;
+    // Allow gfx1151 and RDNA4 (gfx1200/gfx1201), which have native WMMA fragment support above.
+    if (std::strncmp(prop.gcnArchName, "gfx1151", 7) != 0 &&
+        std::strncmp(prop.gcnArchName, "gfx1200", 7) != 0 &&
+        std::strncmp(prop.gcnArchName, "gfx1201", 7) != 0)
+        return d;
     hipFuncAttributes fa{};
     if (hipFuncGetAttributes(&fa, reinterpret_cast<const void*>(native_kernel<T_IQ3_XXS, true, true, NW_LB>)) != hipSuccess) {
         (void) cudaGetLastError(); return d;
