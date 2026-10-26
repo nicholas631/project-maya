@@ -903,6 +903,9 @@ class StrataEngine:
         if self.multi:
             yield from self._generate_multi(ids, max_new, sampling, cancel, embeddings)
             return
+        client_id = (sampling or {}).get("_strata_client_request_id", "")
+        if isinstance(client_id, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", client_id):
+            print(f"[maya] request-map client_request_id={client_id} engine_rid=single sequence_key=single", flush=True)
         self.progress = None
         self.prefill_tok_s_mean = None
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
@@ -1052,6 +1055,11 @@ class StrataEngine:
         """generate() on an engine that runs several conversations: this request's GEN carries rid=<id>, its lines come
         back through its own queue (_route), and STOP <id> ends it alone."""
         rid = next(self._rids)
+        client_id = (sampling or {}).get("_strata_client_request_id", "")
+        if not isinstance(client_id, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", client_id):
+            client_id = ""
+        if client_id:
+            print(f"[maya] request-map client_request_id={client_id} engine_rid={rid} sequence_key={rid}", flush=True)
         q: queue.Queue = queue.Queue()
         with self._routes_lock:
             self._routes[rid] = q
@@ -3734,6 +3742,9 @@ def make_handler(svc: Service):
                     self.wfile.write(body)
                     return
                 if path == "/v1/chat/completions":
+                    client_id = self.headers.get("X-Request-Id", "")
+                    if re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", client_id):
+                        req["_strata_client_request_id"] = client_id
                     self._openai(req)
                 elif path == "/v1/responses":
                     self._responses(req)
