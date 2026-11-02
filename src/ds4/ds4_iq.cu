@@ -2044,7 +2044,10 @@ bool fused_on() {
     const auto it = halo.find(dev);
     if (it != halo.end()) return it->second;
     cudaDeviceProp prop{};
-    const bool on = cudaGetDeviceProperties(&prop, dev) == cudaSuccess && std::strncmp(prop.gcnArchName, "gfx1151", 7) == 0;
+    const bool on = cudaGetDeviceProperties(&prop, dev) == cudaSuccess &&
+                    (std::strncmp(prop.gcnArchName, "gfx1151", 7) == 0 ||
+                     std::strncmp(prop.gcnArchName, "gfx1200", 7) == 0 ||
+                     std::strncmp(prop.gcnArchName, "gfx1201", 7) == 0);
     halo[dev] = on;
     return on;
 }

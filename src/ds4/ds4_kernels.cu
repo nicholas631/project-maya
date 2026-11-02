@@ -49,13 +49,56 @@ __device__ __forceinline__ uint16_t f2bf16(float f) {   // round to nearest even
     return (uint16_t) (u >> 16);
 }
 
+#if defined(STRATA_USE_HIP) && (defined(__GFX11__) || defined(__GFX12__) || defined(__gfx906__))
+template<int Mask> __device__ __forceinline__ float ds4_lane_swizzle(float v) {
+    return __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), Mask));
+}
+template<int Ctrl> __device__ __forceinline__ float ds4_lane_dpp(float v) {
+    return __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), Ctrl, 0xf, 0xf, false));
+}
+#endif
+
 __device__ __forceinline__ float warp_sum(float v) {
+#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+    v += ds4_lane_dpp<0xb1>(v);
+    v += ds4_lane_dpp<0x4e>(v);
+    v += ds4_lane_swizzle<0x101f>(v);
+    v += ds4_lane_swizzle<0x201f>(v);
+    v += ds4_lane_swizzle<0x401f>(v);
+    return v;
+#elif defined(STRATA_USE_HIP) && (defined(__GFX11__) || defined(__GFX12__))
+    const int i = __builtin_bit_cast(int, v);
+    v += __builtin_bit_cast(float, __builtin_amdgcn_permlanex16(i, i, 0x76543210, 0xfedcba98, false, false));
+    v += ds4_lane_dpp<0x168>(v);
+    v += ds4_lane_dpp<0x164>(v);
+    v += ds4_lane_dpp<0x162>(v);
+    v += ds4_lane_dpp<0x161>(v);
+    return v;
+#else
     for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
     return v;
+#endif
 }
 __device__ __forceinline__ float warp_max(float v) {
+#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+    v = fmaxf(v, ds4_lane_dpp<0xb1>(v));
+    v = fmaxf(v, ds4_lane_dpp<0x4e>(v));
+    v = fmaxf(v, ds4_lane_swizzle<0x101f>(v));
+    v = fmaxf(v, ds4_lane_swizzle<0x201f>(v));
+    v = fmaxf(v, ds4_lane_swizzle<0x401f>(v));
+    return v;
+#elif defined(STRATA_USE_HIP) && (defined(__GFX11__) || defined(__GFX12__))
+    const int i = __builtin_bit_cast(int, v);
+    v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_permlanex16(i, i, 0x76543210, 0xfedcba98, false, false)));
+    v = fmaxf(v, ds4_lane_dpp<0x168>(v));
+    v = fmaxf(v, ds4_lane_dpp<0x164>(v));
+    v = fmaxf(v, ds4_lane_dpp<0x162>(v));
+    v = fmaxf(v, ds4_lane_dpp<0x161>(v));
+    return v;
+#else
     for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
     return v;
+#endif
 }
 
 // block-wide sum for blockDim.x <= 1024 (a multiple of 32); every thread gets the result
