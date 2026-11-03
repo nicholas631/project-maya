@@ -829,6 +829,29 @@ layers, then the next GPU's. Four settings help that path when the experts sit i
 | `DS4_CHUNK_AUTO_MIN` | 1024 | with `DS4_CHUNK_AUTO=1`: the smallest chunk, in tokens |
 | `DS4_AI_RUN` | off (0) | `1`: the indexer's slab rows from this prompt's keys, not the context's (VRAM for 128 rows) |
 
+## DeepSeek: expert parallel on a layer split (experimental)
+
+On a layer split (one GPU a group, `DS4_SPLIT`) a prompt runs as a relay, and while one GPU reads its layers' experts
+from RAM over its own PCIe link the other GPUs' links are idle. With `DS4_EP=N` (1 to 3) a layer's owner keeps its
+busiest experts, up to its share, and hands the lighter ones to N idle GPUs: each pulls its rows of x over P2P, DMAs
+its experts from the pinned RAM copies over its own link, runs them on its own chunk buffers and the owner pulls the
+rows of y back and adds them. Most of the bytes move, few of the rows. Only with exactly four GPUs, one GPU a group,
+P2P between them, every layer on one GPU, and prompts of `DS4_EP_MIN_T` to `DS4_EP_MAX_T` tokens; anything else runs
+as before. A helper's experts must be DMA-able from RAM: pinned RAM slots, or (GGUF low-bit packs) pinned copies with
+`DS4_FLOW_COPY_DMA=1`. The split depends only on the routing, so the answers do not depend on timing, but the sums are
+added in another order than without it: the last bits change. If the room for its ring does not fit, the engine
+prints `DS4_EP off` and runs without it.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `DS4_EP` | off (0) | `1`-`3`: idle GPUs (helpers) that take a layer's lighter experts during a prompt on a layer split |
+| `DS4_EP_MIN_T` | 64 | the shortest prompt (tokens) it is used for |
+| `DS4_EP_MAX_T` | 16384 | the longest prompt (tokens) it is used for |
+| `DS4_EP_RING` | 16 | expert slots of a helper's ring in VRAM (each the size of the largest expert) |
+| `DS4_EP_ROWS_CAP` | 4096 | rows of x a layer can hand out (the owner's gather buffer) |
+| `DS4_EP_ROWS` | no limit | an expert with more rows than this stays with its owner |
+| `DS4_EP_MIN_ITEMS` | 8 | fewer light experts than this a helper: fewer helpers (none: the layer as before) |
+
 ## DeepSeek: choosing the drafter GPU group (experimental)
 
 With several GPU groups, the DSpark drafter normally occupies the first group's lead GPU. Set
