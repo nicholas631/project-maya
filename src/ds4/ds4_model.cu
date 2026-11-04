@@ -1094,6 +1094,11 @@ struct WinPlan {
 // ------------------------------------------------------------------ the model
 struct Model::Impl {
     Options o;
+    // a DS4_ setting as MAYA_DS4_* sets it (read as STRATA_DS4_*), else the DS4_* name itself
+    static const char* ds4_env(const char* name) {
+        const char* v = std::getenv((std::string("STRATA_") + name).c_str());
+        return v != nullptr ? v : std::getenv(name);
+    }
 #if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
     std::atomic<bool> peer_ar_failed{false}; // sticky across reset: reload after a transport failure
 #endif
@@ -6052,9 +6057,6 @@ struct Model::Impl {
         if (!in_ram && lc_arena != nullptr && l.nm == 1 && !l.lent_copy.empty() && l.lent_copy[(size_t) e] >= 0) {
             const uint8_t* p = lc_arena + (size_t) l.lent_copy[(size_t) e] * lc_stride;
             for (int r = 0; r < 3; ++r) it.src[r] = p + l.lay.trellis[r] + mx_read_off(l, mi, r);
-            ++c.it_ram;
-            return;
-        }
             ++c.it_ram;
             return;
         }
@@ -13943,11 +13945,6 @@ struct Model::Impl {
     }
 
     // ---- the helper GPU (DS4_HELPER; the state's note by helper_id)
-    // a DS4_ setting as MAYA_DS4_* sets it (read as STRATA_DS4_*), else the DS4_* name itself
-    static const char* ds4_env(const char* name) {
-        const char* v = std::getenv((std::string("STRATA_") + name).c_str());
-        return v != nullptr ? v : std::getenv(name);
-    }
     static bool helper_owned(const Layer& l, int e) { return !l.helper.empty() && l.helper[(size_t) e] != nullptr; }
     // a layer whose CPU-lane picks the helper may take: a GGUF's trunk layer of one GPU - or, with DS4_TP_GGUF_UNEVEN,
     // of a tensor-parallel group.  A group's helper state (its pool's experts, the table, the recent slots) is member
