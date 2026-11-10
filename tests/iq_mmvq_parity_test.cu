@@ -1,4 +1,5 @@
 // tests/iq_mmvq_parity_test.cu - a multi-column iq_mmvq call must equal single-column calls, in bits.
+// revision: 0.0.1 — Q8_0 in parity sweep.
 //
 // The multi-column path moves the block index outermost so one weight block is loaded and dequantised once
 // for every activation column.  That is meant to be a scheduling change only: same per-lane accumulation
@@ -19,10 +20,10 @@
 
 namespace {
 
-constexpr int kTypes[] = {13, 16, 17, 18, 19, 20, 21, 22, 23, 29, 42};
+constexpr int kTypes[] = {8, 13, 16, 17, 18, 19, 20, 21, 22, 23, 29, 42};
 constexpr int kCols[] = {1, 2, 3, 4, 5, 7, 8, 9, 16};
 
-int block_elems(int t) { return t == 20 ? 32 : (t == 42 ? 64 : 256); }
+int block_elems(int t) { return (t == 8 || t == 20) ? 32 : (t == 42 ? 64 : 256); }
 
 }  // namespace
 

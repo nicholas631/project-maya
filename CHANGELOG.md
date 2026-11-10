@@ -4,6 +4,10 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## Unreleased — Q8_0 grouped expert down
+
+Not a published release. `native_expert_grouped` now dispatches down type 8 (`GGML_TYPE_Q8_0`) through `Fmt<8>` and `vec_dot_q8_0_q8_1` in `src/kernels/cuda/iq_kernels.cu` (revision 0.1.3). `tests/iq_mmvq_parity_test.cu` (revision 0.0.1) includes type 8 with a 32-value block. HIP `gfx1201` and CUDA sm_86 `iq_mmvq_parity_test` both reported 108 combinations and 0 numeric differences. That check is multi-column against single-column. A R9700 Qwen completion no longer exits on `down type 8`; the pinball stream from that binary was not coherent English, so this is not a quality sign-off.
+
 ## v1.1.55 - 2026-11-05
 
 Codex CLI works with Maya, web-chat answers always run to their end and survive a restart, and a few speed settings now on by default.
