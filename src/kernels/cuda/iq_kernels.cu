@@ -1,4 +1,5 @@
 // src/kernels/cuda/iq_kernels.cu - see include/strata/kernels/iq_kernels.hpp.
+// revision: 0.1.2 — Q8_0 token-embedding dequant, including single-token gather_one.
 //
 // The dot products (vec_dot_*_q8_1), the dequantizers and the q8_1 quantizer are transcribed from llama.cpp
 // (ggml/src/ggml-cuda/vecdotq.cuh, dequantize.cuh, quantize.cu at the commit in third_party/ggml/VERSION.txt;
@@ -859,6 +860,18 @@ __device__ void dq_iq4_xs(const void* vx, int64_t ibs, dst_t* yy, int tid, const
         y[j + 16] = cvt<dst_t>(d * codebook[q4[j] >> 4]);
     }
 }
+// Q8_0 token embeddings (UD-IQ4_XS stores token_embd.weight as Q8_0). Eight blocks of 32 per
+// 256-wide superblock; each of the 32 threads writes eight values. Not added to is_iq(): the expert
+// matvec does not accept this type.
+template<typename dst_t>
+__device__ void dq_q8_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
+    const block_q8_0* x = (const block_q8_0*) vx + ibs * (QK_K / QK8_0);
+    const int ib = tid % 8, part = tid / 8;
+    dst_t* y = yy + 32 * ib + 8 * part;
+    const float d = (float) x[ib].d;
+    const int8_t* q = x[ib].qs + 8 * part;
+    for (int j = 0; j < 8; ++j) y[j] = cvt<dst_t>(d * (float) q[j]);
+}
 template<typename dst_t>
 __device__ void dq_q2_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     // one "superblock" = 256 values = 4 blocks of 64; thread tid writes 8 values
@@ -895,6 +908,7 @@ template<typename dst_t>
 __device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs, dst_t* y, int tid) {
     switch (ty) {
         case 6: dq_q5_0(vx, ibs, y, tid); break;
+        case 8: dq_q8_0(vx, ibs, y, tid); break;
         case 16: dq_iq2_xxs(vx, ibs, y, tid); break;
         case 17: dq_iq2_xs(vx, ibs, y, tid); break;
         case 18: dq_iq3_xxs(vx, ibs, y, tid); break;
@@ -1004,14 +1018,14 @@ __global__ void embed_rows_kernel(int ty, const uint8_t* __restrict__ table, siz
 void iq_embed_rows(int t, const void* table, size_t row_bytes, const int32_t* tokens, int64_t n_tok, int64_t n_embd,
                    float* out, void* stream) {
     if (n_tok <= 0) return;
-    if (n_embd % 256 != 0 || !is_iq(t)) { std::fprintf(stderr, "iq_embed_rows: bad arguments\n"); std::exit(1); }
+    if (n_embd % 256 != 0 || !(is_iq(t) || t == 8)) { std::fprintf(stderr, "iq_embed_rows: bad arguments\n"); std::exit(1); }
     embed_rows_kernel<<<dim3((unsigned) (n_embd / 256), (unsigned) n_tok), 32, 0, (cudaStream_t) stream>>>(
         t, (const uint8_t*) table, row_bytes, tokens, n_embd, out);
     check("iq_embed_rows");
 }
 
 void iq_dequant_f32(int t, const void* src, int64_t n, float* dst, void* stream) {
-    if (n % 256 != 0 || !is_iq(t)) { std::fprintf(stderr, "iq_dequant_f32: bad arguments\n"); std::exit(1); }
+    if (n % 256 != 0 || !(is_iq(t) || t == 8)) { std::fprintf(stderr, "iq_dequant_f32: bad arguments\n"); std::exit(1); }
     dequant_flat_kernel<float><<<(unsigned) (n / 256), 32, 0, (cudaStream_t) stream>>>(t, src, dst);
     check("iq_dequant_f32");
 }
