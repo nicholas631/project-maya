@@ -4,6 +4,12 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## Unreleased — Q8_0 dequant guard and R9700 Qwen bisect
+
+Not a published release. `iq_dequant_f16` now accepts ggml type 8 the same way it already accepts type 6 (`iq_kernels.cu` 0.1.5). Type 8 is still not in `is_iq()`. The Q8_0 dot and the native Q5_K head dot compile with `#pragma clang fp contract(off)` on HIP. `native_expert_parity` defaults to layers 0, 2, 4, 30, 46, and 47.
+
+A greedy smoke on GPU 4 (`HIP_VISIBLE_DEVICES=4`, temperature 0, thinking off) still repeated `elos` / `ELLA`. The same string came back with `--expert-cache 0`, so the GPU expert cache is not the cause. The engine refuses to start this pack without `--spec` (at least 2) and without `--ple-gguf`, so those two arms are not optional. This is not a quality sign-off.
+
 ## Unreleased — Q8_0 grouped expert down
 
 Not a published release. `native_expert_grouped` now dispatches down type 8 (`GGML_TYPE_Q8_0`) through `Fmt<8>` and `vec_dot_q8_0_q8_1` in `src/kernels/cuda/iq_kernels.cu` (revision 0.1.3). `tests/iq_mmvq_parity_test.cu` (revision 0.0.1) includes type 8 with a 32-value block. HIP `gfx1201` and CUDA sm_86 `iq_mmvq_parity_test` both reported 108 combinations and 0 numeric differences. That check is multi-column against single-column. A R9700 Qwen completion no longer exits on `down type 8`; the pinball stream from that binary was not coherent English, so this is not a quality sign-off.

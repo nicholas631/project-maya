@@ -1,4 +1,5 @@
 // src/kernels/native_expert_parity.cpp - plan v0.3 P6: one native expert three ways, on real GGUF rows.
+// revision: 0.1.1
 //
 //     build/native_expert_parity <shard1.gguf> [layer ...]
 //
@@ -40,7 +41,7 @@ int main(int argc, char** argv) {
     strata::GgufFile gguf(argv[1]);
     std::vector<int> layers;
     for (int i = 2; i < argc; ++i) layers.push_back(std::atoi(argv[i]));
-    if (layers.empty()) layers = {0, 1, 2, 3, 20, 47};
+    if (layers.empty()) layers = {0, 2, 4, 30, 46, 47};
     const int NT = 3, E = 7;
     const int64_t H = 2560, FF = 640;
     int failures = 0;

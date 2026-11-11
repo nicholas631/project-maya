@@ -1,5 +1,5 @@
 // src/kernels/cuda/iq_kernels.cu - see include/strata/kernels/iq_kernels.hpp.
-// revision: 0.1.3 — Q8_0 grouped down matvec; token-embedding dequant / gather_one.
+// revision: 0.1.5 — Q8_0 grouped down matvec; HIP fp-contract off on the Q8_0 dot.
 //
 // The dot products (vec_dot_*_q8_1), the dequantizers and the q8_1 quantizer are transcribed from llama.cpp
 // (ggml/src/ggml-cuda/vecdotq.cuh, dequantize.cuh, quantize.cu at the commit in third_party/ggml/VERSION.txt;
@@ -329,6 +329,9 @@ __device__ __forceinline__ float vec_dot_q5_0_q8_1(const void* __restrict__ vbq,
 // Q8_0: 32 int8 values + fp16 scale d; one call covers 8 values (2 x dp4a, VDR 2, 4 calls per 32-value block).
 __device__ __forceinline__ float vec_dot_q8_0_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
                                                    const int& kbx, const int& iqs) {
+#if defined(__HIPCC__)
+#pragma clang fp contract(off)
+#endif
     const block_q8_0* bq8_0 = (const block_q8_0*) vbq + kbx;
     int sumi = 0;
 #pragma unroll
@@ -1016,8 +1019,8 @@ void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n
 }
 
 void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stream) {
-    // (+ Q5_0: a routed down matrix of unsloth's Qwen3.8 UD-IQ2_XS; iq_supported() stays the i-quant set)
-    if (n % 256 != 0 || !(is_iq(t) || t == 6)) { std::fprintf(stderr, "iq_dequant_f16: bad arguments\n"); std::exit(1); }
+    // (+ Q5_0/Q8_0 routed-down matrices; UD-IQ4_XS layers' Q8_0 dequantized by dq_q8_0; iq_supported() stays the i-quant set)
+    if (n % 256 != 0 || !(is_iq(t) || t == 6 || t == 8)) { std::fprintf(stderr, "iq_dequant_f16: bad arguments\n"); std::exit(1); }
     dequant_flat_kernel<__half><<<(unsigned) (n / 256), 32, 0, (cudaStream_t) stream>>>(t, src, (__half*) dst);
     check("iq_dequant_f16");
 }
