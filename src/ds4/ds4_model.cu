@@ -15134,7 +15134,6 @@ struct Model::Impl {
         int slots = 0;
         int blocks = 1;           // the fetch kernel's grid (a block a multiprocessor)
         cudaStream_t cs = nullptr;   // (the calibration's pulls)
-        cudaEvent_t ev_fetch = nullptr;  // (pipelined async expert fetch event)
         unsigned long long* plan2 = nullptr;   // device [kPicks]: the streamed picks' plan (the second gate / up)
         unsigned *dflag = nullptr, *cflag = nullptr;   // device: the fetch kernel's flags (decode's, the calibration's)
         uint8_t* host_dev = nullptr;           // ln_host as this device addresses it, its slots hstride apart
@@ -15299,7 +15298,6 @@ struct Model::Impl {
             D.stride = stride;
             ln_stride = std::max(ln_stride, stride);
             CK(cudaStreamCreateWithFlags(&D.cs, cudaStreamNonBlocking));
-            CK(cudaEventCreateWithFlags(&D.ev_fetch, cudaEventDisableTiming));
             if (!dalloc(d, D.plan2, kPicks, err) || !dalloc(d, D.dflag, pcie::kPullFlags, err) ||
                 !dalloc(d, D.cflag, pcie::kPullFlags, err))
                 return false;
@@ -15318,10 +15316,6 @@ struct Model::Impl {
         cudaSetDevice(d.id);
         auto it = std::find(d.allocs.begin(), d.allocs.end(), (void*) D.vram);
         if (it != d.allocs.end()) d.allocs.erase(it);
-        if (D.ev_fetch != nullptr) {
-            cudaEventDestroy(D.ev_fetch);
-            D.ev_fetch = nullptr;
-        }
         cudaFree(D.vram);
         D.vram = nullptr;
     }
@@ -21524,35 +21518,16 @@ struct Model::Impl {
                 ma.n_ff = FF;
                 ma.limit = g.lim;
                 const bool mx = lay.fmt == gg::kFmtMXFP4;
-                static const bool use_async_fetch = [] {
-                    const char* v = std::getenv("MAYA_DS4_PREFETCH_STREAM");
-                    if (v == nullptr) v = std::getenv("DS4_PREFETCH_STREAM");
-                    return v == nullptr || std::atoi(v) != 0;
-                }();
-                if (lc >= 0 && use_async_fetch) {
+                if (mx) gg::moe_gate_up(ma, d.x, d.xg, s);
+                else x3::moe_gate_up(ma, d.x, d.xg, s);
+                prof_mark(d, 3);
+                if (lc >= 0) {
                     const LaneDev& LD = ln_dev[(size_t) l.dev];
                     pcie::stream_fetch(ln_pull + slot, sq, LD.dflag, LD.vram, LD.stride, lane_mats(l), !LD.direct,
-                                       d.plan_ptr, LD.plan2, l.k_exp, LD.blocks, LD.cs);
-                    cudaEventRecord(LD.ev_fetch, LD.cs);
-                    if (mx) gg::moe_gate_up(ma, d.x, d.xg, s);
-                    else x3::moe_gate_up(ma, d.x, d.xg, s);
-                    prof_mark(d, 3);
-                    cudaStreamWaitEvent(s, LD.ev_fetch, 0);
+                                       d.plan_ptr, LD.plan2, l.k_exp, LD.blocks, s);
                     x3::MoeArgs m2 = ma;
                     m2.plan_ptr = LD.plan2;
                     gg::moe_gate_up(m2, d.x, d.xg, s);
-                } else {
-                    if (mx) gg::moe_gate_up(ma, d.x, d.xg, s);
-                    else x3::moe_gate_up(ma, d.x, d.xg, s);
-                    prof_mark(d, 3);
-                    if (lc >= 0) {
-                        const LaneDev& LD = ln_dev[(size_t) l.dev];
-                        pcie::stream_fetch(ln_pull + slot, sq, LD.dflag, LD.vram, LD.stride, lane_mats(l), !LD.direct,
-                                           d.plan_ptr, LD.plan2, l.k_exp, LD.blocks, s);
-                        x3::MoeArgs m2 = ma;
-                        m2.plan_ptr = LD.plan2;
-                        gg::moe_gate_up(m2, d.x, d.xg, s);
-                    }
                 }
                 if (lead && !zc_nowait) wait_seq(&resps[slot].seq, sq, s);
                 prof_mark(d, 4);
