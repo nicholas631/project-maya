@@ -1,0 +1,58 @@
+{
+  "name": "maya-mm3-opt-m.json",
+  "description": "Tuned run config for MiniMax-M3.1 Maya-XS (IQ1_S) on Enclave 2 RTX 3090 with SM86 Persistent LUT Grids and Sub-Block Lookahead (AH=1).",
+  "revision": "0.4.0",
+  "exe": "/home/nick/Python_Projects/project-maya-v1117/build/maya-mm3",
+  "args": [
+    "--pack",
+    "/models/u2_c/minimax/Maya-XS/Maya-XS/maya-mm3",
+    "--max-context",
+    "163840",
+    "--parallel",
+    "1",
+    "--gpus",
+    "0",
+    "--tp",
+    "1",
+    "--kv-cache",
+    "int8",
+    "--kv-rot",
+    "on",
+    "--kv-streaming",
+    "on",
+    "--dspark",
+    "on",
+    "--staging",
+    "96",
+    "--kv-resident",
+    "32768",
+    "--cpu-threads",
+    "24",
+    "--expert-profile",
+    "/home/nick/Python_Projects/project-maya-v1117/data/expert-profile-mm3.bin",
+    "--chunk",
+    "4096"
+  ],
+  "cwd": "/home/nick/Python_Projects/project-maya-v1117",
+  "tokenizer": "/models/u2_c/minimax/Maya-XS/Maya-XS/maya-mm3/tokenizer",
+  "backend": "cuda",
+  "model_name": "minimax-m3.1-flash",
+  "gpu": [
+    0
+  ],
+  "sampling": {
+    "temperature": 1.0,
+    "top_p": 0.95
+  },
+  "port": 8203,
+  "host": "127.0.0.1",
+  "lib_dirs": [
+    "/home/nick/cuda-13.2/lib"
+  ],
+  "env": {
+    "MAYA_GLM_RAM_HEADROOM_GB": "64",
+    "MM3_INDEX_TC": "1",
+    "MM3_Q8MV_TC": "2"
+  },
+  "log": "/home/nick/Python_Projects/LLM_Mi50_project/logs/enclave2-minimax.log"
+}

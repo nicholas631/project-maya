@@ -1,0 +1,120 @@
+{
+ "since": 1794430026.709868,
+ "models": {
+  "maya-glm-m-candidate.json": {
+   "since": 1794430026.7099648,
+   "bands": {
+    "base": {
+     "input": 213,
+     "cached": 0,
+     "output": 750,
+     "requests": 5
+    },
+    "peak": {
+     "input": 0,
+     "cached": 0,
+     "output": 0,
+     "requests": 0
+    }
+   },
+   "model": "glm-5.3-flash",
+   "quant": "glm-m-candidate"
+  },
+  "maya-minimax-candidate.json": {
+   "since": 1794430545.1864264,
+   "bands": {
+    "base": {
+     "input": 212,
+     "cached": 0,
+     "output": 150,
+     "requests": 1
+    },
+    "peak": {
+     "input": 0,
+     "cached": 0,
+     "output": 0,
+     "requests": 0
+    }
+   },
+   "model": "minimax-m3.1-flash",
+   "quant": "minimax-candidate"
+  },
+  "maya-ds4-candidate.json": {
+   "since": 1794430842.9818015,
+   "bands": {
+    "base": {
+     "input": 61,
+     "cached": 59,
+     "output": 300,
+     "requests": 2
+    },
+    "peak": {
+     "input": 0,
+     "cached": 0,
+     "output": 0,
+     "requests": 0
+    }
+   },
+   "model": "deepseek-v4.1-flash",
+   "quant": "ds4-candidate"
+  },
+  "maya-glm-arm2.json": {
+   "since": 1794492913.8249016,
+   "bands": {
+    "base": {
+     "input": 1429,
+     "cached": 31,
+     "output": 1021,
+     "requests": 10
+    },
+    "peak": {
+     "input": 0,
+     "cached": 0,
+     "output": 0,
+     "requests": 0
+    }
+   },
+   "model": "glm-5.3-flash",
+   "quant": "glm-arm2"
+  },
+  "maya-mm3-arm2.json": {
+   "since": 1794493488.522268,
+   "bands": {
+    "base": {
+     "input": 1461,
+     "cached": 1719,
+     "output": 1804,
+     "requests": 10
+    },
+    "peak": {
+     "input": 0,
+     "cached": 0,
+     "output": 0,
+     "requests": 0
+    }
+   },
+   "model": "minimax-m3.1-flash",
+   "quant": "mm3-arm2"
+  },
+  "maya-ds4-arm2.json": {
+   "since": 1794494002.059079,
+   "bands": {
+    "base": {
+     "input": 1585,
+     "cached": 48,
+     "output": 1385,
+     "requests": 10
+    },
+    "peak": {
+     "input": 0,
+     "cached": 0,
+     "output": 0,
+     "requests": 0
+    }
+   },
+   "model": "deepseek-v4.1-flash",
+   "quant": "ds4-arm2"
+  }
+ },
+ "prices": {}
+}

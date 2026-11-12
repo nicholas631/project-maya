@@ -1,0 +1,58 @@
+{
+  "name": "maya-ds4-opt-d.json",
+  "description": "Tuned run config for DeepSeek V4.1 Maya-XS (IQ1_S) on Enclave 2 RTX 3090 with 0.80 VRAM experts, SM86 Tensor Core Indexer, Q8MV_TC=2, and 16MB Ring.",
+  "revision": "0.5.0",
+  "exe": "/home/nick/Python_Projects/project-maya-v1117/build/maya-ds4",
+  "args": [
+    "--pack",
+    "/models/u2_d/maya-ds4/Maya-XS/maya-ds4",
+    "--max-context",
+    "163840",
+    "--parallel",
+    "1",
+    "--gpus",
+    "0",
+    "--tp",
+    "1",
+    "--mmap-experts",
+    "auto",
+    "--threads",
+    "on",
+    "--cpu-threads",
+    "24",
+    "--vision",
+    "off",
+    "--dspark",
+    "auto",
+    "--expert-profile",
+    "/home/nick/Python_Projects/project-maya-v1117/data/expert-profile-ds4.bin",
+    "--vram-experts",
+    "0.81",
+    "--prefill-chunk",
+    "4096"
+  ],
+  "cwd": "/home/nick/Python_Projects/project-maya-v1117",
+  "tokenizer": "/models/u2_d/maya-ds4/Maya-XS/maya-ds4/tokenizer",
+  "backend": "cuda",
+  "model_name": "deepseek-v4.1-flash",
+  "gpu": [
+    0
+  ],
+  "sampling": {
+    "temperature": 1.0,
+    "top_p": 1.0
+  },
+  "reasoning_effort": "high",
+  "port": 8204,
+  "host": "127.0.0.1",
+  "lib_dirs": [
+    "/home/nick/cuda-13.2/lib"
+  ],
+  "env": {
+    "MAYA_GLM_RAM_HEADROOM_GB": "64",
+    "DS4_INDEX_TC": "1",
+    "DS4_Q8MV_TC": "3",
+    "DS4_RING_MB": "24"
+  },
+  "log": "/home/nick/Python_Projects/LLM_Mi50_project/logs/enclave2-deepseek.log"
+}
