@@ -4567,13 +4567,35 @@ __device__ __forceinline__ uint4 ld_stream_u4(const uint4* p) {
 #endif
 }
 
+__device__ __forceinline__ void st_stream_u4(uint4* p, uint4 v) {
+#if !defined(STRATA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("st.global.cs.v4.u32 [%0], {%1, %2, %3, %4};"
+                 :: "l"(p), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w)
+                 : "memory");
+#else
+    *p = v;
+#endif
+}
+
 __global__ void __launch_bounds__(256) moe_prefetch_kernel(MoeDev d, size_t n16) {
     const int n = *d.pf_n;
     for (int i = 0; i < n; ++i) {
         const uint4* s = (const uint4*) d.pf_src[i];
         uint4* t = (uint4*) d.pf_dst[i];
-        for (size_t j = blockIdx.x * (size_t) blockDim.x + threadIdx.x; j < n16; j += (size_t) gridDim.x * blockDim.x)
-            t[j] = ld_stream_u4(&s[j]);
+        size_t j = blockIdx.x * (size_t) blockDim.x + threadIdx.x;
+        const size_t stride = (size_t) gridDim.x * blockDim.x;
+        for (; j + 3 * stride < n16; j += 4 * stride) {
+            uint4 v0 = ld_stream_u4(&s[j]);
+            uint4 v1 = ld_stream_u4(&s[j + stride]);
+            uint4 v2 = ld_stream_u4(&s[j + 2 * stride]);
+            uint4 v3 = ld_stream_u4(&s[j + 3 * stride]);
+            st_stream_u4(&t[j], v0);
+            st_stream_u4(&t[j + stride], v1);
+            st_stream_u4(&t[j + 2 * stride], v2);
+            st_stream_u4(&t[j + 3 * stride], v3);
+        }
+        for (; j < n16; j += stride)
+            st_stream_u4(&t[j], ld_stream_u4(&s[j]));
     }
 }
 
@@ -4628,8 +4650,21 @@ __device__ void moe_stream_copy(const MoeDev& d, int i, const uint8_t* s, uint8_
         const size_t nbytes = (size_t) (a1 - a0);
         if ((((unsigned long long) sp | (unsigned long long) tp) & 15ull) == 0ull) {
             const size_t m16 = nbytes / 16;
-            for (size_t j = threadIdx.x; j < m16; j += blockDim.x) ((uint4*) tp)[j] = ld_stream_u4(&((const uint4*) sp)[j]);
-            for (size_t j = m16 * 16 + threadIdx.x; j < nbytes; j += blockDim.x) tp[j] = sp[j];
+            size_t j = threadIdx.x;
+            const size_t stride = blockDim.x;
+            for (; j + 3 * stride < m16; j += 4 * stride) {
+                uint4 v0 = ld_stream_u4(&((const uint4*) sp)[j]);
+                uint4 v1 = ld_stream_u4(&((const uint4*) sp)[j + stride]);
+                uint4 v2 = ld_stream_u4(&((const uint4*) sp)[j + 2 * stride]);
+                uint4 v3 = ld_stream_u4(&((const uint4*) sp)[j + 3 * stride]);
+                st_stream_u4(&((uint4*) tp)[j], v0);
+                st_stream_u4(&((uint4*) tp)[j + stride], v1);
+                st_stream_u4(&((uint4*) tp)[j + 2 * stride], v2);
+                st_stream_u4(&((uint4*) tp)[j + 3 * stride], v3);
+            }
+            for (; j < m16; j += stride)
+                st_stream_u4(&((uint4*) tp)[j], ld_stream_u4(&((const uint4*) sp)[j]));
+            for (size_t k = m16 * 16 + threadIdx.x; k < nbytes; k += blockDim.x) tp[k] = sp[k];
         } else {
             for (size_t j = threadIdx.x; j < nbytes; j += blockDim.x) tp[j] = sp[j];
         }
@@ -4651,8 +4686,20 @@ __global__ void __launch_bounds__(256) moe_fetch_kernel(MoeDev d, int k, size_t 
         }
         const uint4* s = (const uint4*) src;
         uint4* t = (uint4*) d.plan_ptr[i];
-        for (size_t j = blockIdx.x * (size_t) blockDim.x + threadIdx.x; j < n16; j += (size_t) gridDim.x * blockDim.x)
-            t[j] = ld_stream_u4(&s[j]);
+        size_t j = blockIdx.x * (size_t) blockDim.x + threadIdx.x;
+        const size_t stride = (size_t) gridDim.x * blockDim.x;
+        for (; j + 3 * stride < n16; j += 4 * stride) {
+            uint4 v0 = ld_stream_u4(&s[j]);
+            uint4 v1 = ld_stream_u4(&s[j + stride]);
+            uint4 v2 = ld_stream_u4(&s[j + 2 * stride]);
+            uint4 v3 = ld_stream_u4(&s[j + 3 * stride]);
+            st_stream_u4(&t[j], v0);
+            st_stream_u4(&t[j + stride], v1);
+            st_stream_u4(&t[j + 2 * stride], v2);
+            st_stream_u4(&t[j + 3 * stride], v3);
+        }
+        for (; j < n16; j += stride)
+            st_stream_u4(&t[j], ld_stream_u4(&s[j]));
     }
 }
 
@@ -4719,8 +4766,20 @@ __global__ void __launch_bounds__(256) moe_wait_fetch_kernel(MoeDev d, int n_emb
         }
         const uint4* s = (const uint4*) src;
         uint4* t = (uint4*) d.plan_ptr[i];
-        for (size_t j = blockIdx.x * (size_t) blockDim.x + threadIdx.x; j < n16; j += (size_t) gridDim.x * blockDim.x)
-            t[j] = ld_stream_u4(&s[j]);
+        size_t j = blockIdx.x * (size_t) blockDim.x + threadIdx.x;
+        const size_t stride = (size_t) gridDim.x * blockDim.x;
+        for (; j + 3 * stride < n16; j += 4 * stride) {
+            uint4 v0 = ld_stream_u4(&s[j]);
+            uint4 v1 = ld_stream_u4(&s[j + stride]);
+            uint4 v2 = ld_stream_u4(&s[j + 2 * stride]);
+            uint4 v3 = ld_stream_u4(&s[j + 3 * stride]);
+            st_stream_u4(&t[j], v0);
+            st_stream_u4(&t[j + stride], v1);
+            st_stream_u4(&t[j + 2 * stride], v2);
+            st_stream_u4(&t[j + 3 * stride], v3);
+        }
+        for (; j < n16; j += stride)
+            st_stream_u4(&t[j], ld_stream_u4(&s[j]));
     }
 }
 

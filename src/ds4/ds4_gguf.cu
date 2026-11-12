@@ -1705,10 +1705,12 @@ void mv_launch(int f, const BfJobs& J, int nj, int max_n, bool vec, cudaStream_t
     } else if (f == 2) {   // (vec here: every row 4-byte aligned, so staged)
         // DS4_Q8MV_TC=1: the tensor-core kernel for 3..16 columns (2: also 2), the same bits; 32 rows a CTA in
         // 16-block chunks when that still gives 128+ CTAs, else 16 a CTA in 32-block chunks - the microbench's best
-        // (MAYA_DS4_Q8MV_TC, read as STRATA_DS4_Q8MV_TC, else DS4_Q8MV_TC; compute capability 8.0+, CUDA - q8_tc_dev)
+        // (MAYA_DS4_Q8MV_TC, read as STRATA_DS4_Q8MV_TC, else DS4_Q8MV_TC / MM3_Q8MV_TC; compute capability 8.0+, CUDA - q8_tc_dev)
         static const int tc = [] {
             const char* v = std::getenv("STRATA_DS4_Q8MV_TC");
             if (v == nullptr) v = std::getenv("DS4_Q8MV_TC");
+            if (v == nullptr) v = std::getenv("STRATA_MM3_Q8MV_TC");
+            if (v == nullptr) v = std::getenv("MM3_Q8MV_TC");
             return v != nullptr ? std::atoi(v) : 0;
         }();
         if (vec && tc > 0 && (NC >= 4 || (tc >= 2 && NC == 2)) && q8_tc_ok(J, nj) && q8_tc_dev()) {
