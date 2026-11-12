@@ -1720,6 +1720,23 @@ void mv_launch(int f, const BfJobs& J, int nj, int max_n, bool vec, cudaStream_t
             if (v == nullptr) v = std::getenv("MM3_Q8MV_TC_STAGES");
             return v != nullptr ? std::atoi(v) : 3;
         }();
+#if !defined(STRATA_USE_HIP)
+        static const bool tc_init [[maybe_unused]] = [] {
+            constexpr int s2_16 = q8_tc_smem<2, 3, 16>();
+            constexpr int s1_32 = q8_tc_smem<1, 3, 32>();
+            cudaFuncSetAttribute(q8_mv_tc_kernel<1, 2, 3, 16>, cudaFuncAttributeMaxDynamicSharedMemorySize, s2_16);
+            cudaFuncSetAttribute(q8_mv_tc_kernel<2, 2, 3, 16>, cudaFuncAttributeMaxDynamicSharedMemorySize, s2_16);
+            cudaFuncSetAttribute(q8_mv_tc_kernel<4, 2, 3, 16>, cudaFuncAttributeMaxDynamicSharedMemorySize, s2_16);
+            cudaFuncSetAttribute(q8_mv_tc_kernel<8, 2, 3, 16>, cudaFuncAttributeMaxDynamicSharedMemorySize, s2_16);
+            cudaFuncSetAttribute(q8_mv_tc_kernel<16, 2, 3, 16>, cudaFuncAttributeMaxDynamicSharedMemorySize, s2_16);
+            cudaFuncSetAttribute(q8_mv_tc_kernel<1, 1, 3, 32>, cudaFuncAttributeMaxDynamicSharedMemorySize, s1_32);
+            cudaFuncSetAttribute(q8_mv_tc_kernel<2, 1, 3, 32>, cudaFuncAttributeMaxDynamicSharedMemorySize, s1_32);
+            cudaFuncSetAttribute(q8_mv_tc_kernel<4, 1, 3, 32>, cudaFuncAttributeMaxDynamicSharedMemorySize, s1_32);
+            cudaFuncSetAttribute(q8_mv_tc_kernel<8, 1, 3, 32>, cudaFuncAttributeMaxDynamicSharedMemorySize, s1_32);
+            cudaFuncSetAttribute(q8_mv_tc_kernel<16, 1, 3, 32>, cudaFuncAttributeMaxDynamicSharedMemorySize, s1_32);
+            return true;
+        }();
+#endif
         if (vec && tc > 0 && (NC >= 4 || (tc >= 2 && NC == 2)) && q8_tc_ok(J, nj) && q8_tc_dev()) {
             if (tc_stg == 3) {
                 if ((max_n + 31) / 32 * nj >= 128)
