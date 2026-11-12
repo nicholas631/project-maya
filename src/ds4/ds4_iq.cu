@@ -786,13 +786,13 @@ struct Ahead {
 // summed in the same order: every output keeps its bits, whatever the grid.  The smaller codebooks keep the full grid (a
 // block there loads little, and one of an empty group leaves at once).  CUDA's maya-ds4 only: HIP and maya-mm3's build
 // of this file (MAYA_DS4_IQ_ONLY) keep the full grids, and so do MiniMax's epilogues (EPI 1..3).
-#if defined(STRATA_USE_HIP) || defined(MAYA_DS4_IQ_ONLY)
+#if defined(STRATA_USE_HIP)
 #define DS4_IQ_PERSIST_BUILD 0
 #else
 #define DS4_IQ_PERSIST_BUILD 1
 #endif
 template <int T, int EPI>
-constexpr bool kPersist = DS4_IQ_PERSIST_BUILD && Ty<T>::TAB * 4 >= 8192 && EPI == 0;
+constexpr bool kPersist = DS4_IQ_PERSIST_BUILD && Ty<T>::TAB * 4 >= 8192 && EPI <= 3;
 // IQ1_M in a persistent kernel: its codes from a table of kIq1mCodes entries (ds4_iq1_codes.hpp), built once a block
 template <int T, bool PS>
 constexpr bool kCodes = PS && T == kIQ1_M;
@@ -1527,7 +1527,8 @@ void launch_gu(const Args& a, dim3 grid, cudaStream_t s) {
 #if DS4_IQ_PERSIST_BUILD
     if constexpr (kPersist<T, EPI>)
         if (persist_plain<T>()) {   // (an item a block (x, group) of the grid below)
-            constexpr auto K = gate_up_kernel<T, NE, 1, false, kGuRW, EPI, true>;
+            constexpr bool AH_PS = (T == kIQ1_S || T == kIQ1_M);
+            constexpr auto K = gate_up_kernel<T, NE, 1, AH_PS, kGuRW, EPI, true>;
             pdl_launch(K, persist_blocks<K>((long long) grid.x * grid.y), kThreads, 0, s, a, (int) grid.y);
             return;
         }
@@ -1548,7 +1549,8 @@ void launch_dn(const Args& a, dim3 grid, cudaStream_t s) {
 #if DS4_IQ_PERSIST_BUILD
     if constexpr (kPersist<T, 0>)
         if (persist_plain<T>()) {
-            constexpr auto K = down_kernel<T, NE, 1, false, kDnRW, true>;
+            constexpr bool AH_PS = (T == kIQ1_S || T == kIQ1_M);
+            constexpr auto K = down_kernel<T, NE, 1, AH_PS, kDnRW, true>;
             pdl_launch(K, persist_blocks<K>((long long) grid.x * grid.y), kThreads, 0, s, a, (int) grid.y);
             return;
         }

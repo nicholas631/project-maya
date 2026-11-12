@@ -200,7 +200,9 @@ __global__ void wait_kernel(const unsigned* p, unsigned v, unsigned long long li
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));   // (ns)
 #endif
     while (*(volatile const unsigned*) p != v) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+        __nanosleep(64);
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
         __nanosleep(200);
 #endif
 #if defined(STRATA_USE_HIP)

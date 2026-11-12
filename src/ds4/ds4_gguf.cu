@@ -957,7 +957,9 @@ __global__ void mx_wait_kernel(const unsigned* p, unsigned v) {
     pdl_wait();
     if (threadIdx.x != 0) return;
     while (*(volatile const unsigned*) p != v) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+        __nanosleep(64);
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
         __nanosleep(200);
 #endif
     }

@@ -4555,13 +4555,25 @@ __global__ void moe_cpu_wait_streams_kernel(MoeDev d, int n_embd, const float* p
     }
 }
 
+__device__ __forceinline__ uint4 ld_stream_u4(const uint4* p) {
+#if !defined(STRATA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    uint4 v;
+    asm volatile("ld.global.cg.v4.u32 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+                 : "l"(p));
+    return v;
+#else
+    return *p;
+#endif
+}
+
 __global__ void __launch_bounds__(256) moe_prefetch_kernel(MoeDev d, size_t n16) {
     const int n = *d.pf_n;
     for (int i = 0; i < n; ++i) {
         const uint4* s = (const uint4*) d.pf_src[i];
         uint4* t = (uint4*) d.pf_dst[i];
         for (size_t j = blockIdx.x * (size_t) blockDim.x + threadIdx.x; j < n16; j += (size_t) gridDim.x * blockDim.x)
-            t[j] = s[j];
+            t[j] = ld_stream_u4(&s[j]);
     }
 }
 
@@ -4601,7 +4613,9 @@ __device__ void moe_stream_copy(const MoeDev& d, int i, const uint8_t* s, uint8_
             const long long t0 = clock64();
             while (((r->ready[i] >> bit) & 1u) == 0u) {
                 if (clock64() - t0 > (1ll << 36)) break;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+                __nanosleep(64);    // (SM86 low-jitter poll over PCIe beside the copies)
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
                 __nanosleep(128);   // (fewer polls over PCIe beside the copies)
 #endif
             }
@@ -4614,7 +4628,7 @@ __device__ void moe_stream_copy(const MoeDev& d, int i, const uint8_t* s, uint8_
         const size_t nbytes = (size_t) (a1 - a0);
         if ((((unsigned long long) sp | (unsigned long long) tp) & 15ull) == 0ull) {
             const size_t m16 = nbytes / 16;
-            for (size_t j = threadIdx.x; j < m16; j += blockDim.x) ((uint4*) tp)[j] = ((const uint4*) sp)[j];
+            for (size_t j = threadIdx.x; j < m16; j += blockDim.x) ((uint4*) tp)[j] = ld_stream_u4(&((const uint4*) sp)[j]);
             for (size_t j = m16 * 16 + threadIdx.x; j < nbytes; j += blockDim.x) tp[j] = sp[j];
         } else {
             for (size_t j = threadIdx.x; j < nbytes; j += blockDim.x) tp[j] = sp[j];
@@ -4638,7 +4652,7 @@ __global__ void __launch_bounds__(256) moe_fetch_kernel(MoeDev d, int k, size_t 
         const uint4* s = (const uint4*) src;
         uint4* t = (uint4*) d.plan_ptr[i];
         for (size_t j = blockIdx.x * (size_t) blockDim.x + threadIdx.x; j < n16; j += (size_t) gridDim.x * blockDim.x)
-            t[j] = s[j];
+            t[j] = ld_stream_u4(&s[j]);
     }
 }
 
@@ -4706,7 +4720,7 @@ __global__ void __launch_bounds__(256) moe_wait_fetch_kernel(MoeDev d, int n_emb
         const uint4* s = (const uint4*) src;
         uint4* t = (uint4*) d.plan_ptr[i];
         for (size_t j = blockIdx.x * (size_t) blockDim.x + threadIdx.x; j < n16; j += (size_t) gridDim.x * blockDim.x)
-            t[j] = s[j];
+            t[j] = ld_stream_u4(&s[j]);
     }
 }
 
@@ -6709,7 +6723,9 @@ __global__ void moe_pf_wait_kernel(const unsigned int* need, const unsigned int*
     if (n == 0u) return;
     for (long long i = 0; i < (1ll << 27); ++i) {
         if ((int) (*(volatile const unsigned int*) flag - n) >= 0) return;
-#if !defined(STRATA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700   // (Pascal: no __nanosleep, a plain spin)
+#if !defined(STRATA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+        __nanosleep(64);
+#elif !defined(STRATA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700   // (Pascal: no __nanosleep, a plain spin)
         __nanosleep(200);
 #endif
     }

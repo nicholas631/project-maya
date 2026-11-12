@@ -53,8 +53,22 @@ __device__ __forceinline__ unsigned long long pull_clock() {
 }
 
 __device__ __forceinline__ void pull_nap() {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    __nanosleep(64);
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
     __nanosleep(500);
+#endif
+}
+
+__device__ __forceinline__ uint4 pull_ld_u4(const uint4* p) {
+#if !defined(STRATA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    uint4 v;
+    asm volatile("ld.global.cg.v4.u32 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+                 : "l"(p));
+    return v;
+#else
+    return *p;
 #endif
 }
 
@@ -114,7 +128,7 @@ __global__ void __launch_bounds__(256) stream_fetch_kernel(Pull* p, unsigned seq
             uint4* dst = (uint4*) (s_dst[i] + m.off[r]);
             const size_t n16 = (m.bytes[r] + 15) / 16;
             for (size_t j = (size_t) blockIdx.x * blockDim.x + tid; j < n16; j += (size_t) gridDim.x * blockDim.x)
-                dst[j] = src[j];
+                dst[j] = pull_ld_u4(&src[j]);
         }
     }
     __syncthreads();
