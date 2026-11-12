@@ -1723,7 +1723,7 @@ void mv_launch(int f, const BfJobs& J, int nj, int max_n, bool vec, cudaStream_t
         static const int tc_mt = [] {
             const char* v = std::getenv("DS4_TC_MT");
             if (v == nullptr) v = std::getenv("MAYA_DS4_TC_MT");
-            return v != nullptr ? std::atoi(v) : 1;
+            return v != nullptr ? std::atoi(v) : 2;
         }();
 #if !defined(STRATA_USE_HIP)
         static const bool tc_init [[maybe_unused]] = [] {

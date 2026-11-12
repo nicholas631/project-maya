@@ -453,30 +453,19 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
             load_tiles<K2>(tile + (size_t) (q + 1) * 8 * sstride, sstride, lane, wn);
             if (rot) chunk_load(x, suh, k0 + (q + 1) * kCols, lane, xv, xs4);
         }
-#if defined(EXL3_TC)
-        uint32_t b0_arr[8], b1_arr[8];
-        if (g < nc) {
-            const __half* xr_base = xq + g * kCols + 2 * t;
-#pragma unroll
-            for (int s = 0; s < 8; ++s) {
-                b0_arr[s] = *reinterpret_cast<const uint32_t*>(xr_base + s * 16);
-                b1_arr[s] = *reinterpret_cast<const uint32_t*>(xr_base + s * 16 + 8);
-            }
-        } else {
-#pragma unroll
-            for (int s = 0; s < 8; ++s) {
-                b0_arr[s] = 0u;
-                b1_arr[s] = 0u;
-            }
-        }
-#endif
 #pragma unroll
         for (int s = 0; s < 8; ++s) {
             uint32_t f[4];
             slice_frags<K2, cb>(wc[s], st, lane, f);
 #if defined(EXL3_TC)
             // A: rows (outputs) g / g + 8, columns (inputs) 2t.. / 2t + 8..: steps 0,1 / 4,5 / 2,3 / 6,7
-            mma_f32(c, f[0], f[2], f[1], f[3], b0_arr[s], b1_arr[s]);
+            uint32_t b0 = 0, b1 = 0;
+            if (g < nc) {
+                const __half* xr = xq + g * kCols + s * 16 + 2 * t;
+                b0 = *reinterpret_cast<const uint32_t*>(xr);
+                b1 = *reinterpret_cast<const uint32_t*>(xr + 8);
+            }
+            mma_f32(c, f[0], f[2], f[1], f[3], b0, b1);
 #elif defined(EXL3_WM70)
             // f: outputs g (f[0], f[1]) and g + 8 (f[2], f[3]), inputs 2t, 2t + 1 (f[0], f[2]) / 2t + 8, 2t + 9
             wt[g * kWtPitch + t] = f[0];
