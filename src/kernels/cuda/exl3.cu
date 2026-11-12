@@ -36,6 +36,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <string>
 #include <type_traits>
 #include <utility>
 
@@ -48,6 +49,7 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s);
 void moe_gate_up(const MoeArgs& a, const float* x, float* h, cudaStream_t s);
 void moe_down(const MoeArgs& a, const float* h, const float* sh_out, float* out, cudaStream_t s);
 bool win_experts(const WinArgs& a, cudaStream_t s);
+void decode_table(int cb, bool f32, float* d_out, cudaStream_t s);
 }  // namespace strata::kernels::exl3::legacy
 #define EXL3_LEGACY(call) \
     if (use_legacy()) return legacy::call
@@ -116,6 +118,29 @@ __device__ __forceinline__ __half2 decode2h(uint32_t s0, uint32_t s1) {
         return __hadd2(lo, hi);
     }
 }
+#if defined(STRATA_USE_HIP)
+// codebook 2's products s 0x83DCD12D (mod 2^32) of two 16-bit states - the LOW halves of s0 and s1, their high halves
+// not read - at full rate (AMD's 32-bit multiply is quarter rate): s 0x83DCD12D = s 0xD12D + (s 0x83DC mod 2^16) 2^16.
+// One byte permute packs the two states, two packed 16-bit multiplies by (0x83DC : 0) give each state's high part
+// already in the high half, and a 16 x 16 multiply-add each adds the low part.  The same products, so the same bits
+__device__ __forceinline__ void mul_3inst2(uint32_t s0, uint32_t s1, uint32_t& x0, uint32_t& x1) {
+    const uint32_t p = __builtin_amdgcn_perm(s1, s0, 0x05040100u);   // s1's low half : s0's low half
+    uint32_t h0, h1;
+    asm("v_pk_mul_lo_u16 %0, %1, %2 op_sel_hi:[0,1]" : "=v"(h0) : "v"(p), "s"(0x83DC0000u));   // s0 0x83DC : 0
+    asm("v_pk_mul_lo_u16 %0, %1, %2" : "=v"(h1) : "v"(p), "s"(0x83DC0000u));                   // s1 0x83DC : 0
+    asm("v_mad_u32_u16 %0, %1, %2, %3" : "=v"(x0) : "v"(p), "s"(0xD12Du), "v"(h0));
+    asm("v_mad_u32_u16 %0, %1, %2, %3 op_sel:[1,0,0,0]" : "=v"(x1) : "v"(p), "s"(0xD12Du), "v"(h1));
+}
+// decode2h<2> through mul_3inst2: the decode GEMV's (block_gemv's) - in the prompt's WMMA kernels it measured slower
+// than v_mul_lo_u32 (exl3_test --bench-set), so they keep decode2h
+__device__ __forceinline__ __half2 decode2h_pk(uint32_t s0, uint32_t s1) {
+    uint32_t x0, x1;
+    mul_3inst2(s0, s1, x0, x1);
+    const uint32_t a = bytesum_plus(x0, 0x6400u), b = bytesum_plus(x1, 0x6400u);
+    const __half2 h = __halves2half2(__ushort_as_half((unsigned short) a), __ushort_as_half((unsigned short) b));
+    return __hfma2(h, __half2half2(__ushort_as_half(0x1eee)), __half2half2(__ushort_as_half(0xc931)));
+}
+#endif
 template <int cb>
 __device__ __forceinline__ float2 decode2(uint32_t s0, uint32_t s1) {
     return __half22float2(decode2h<cb>(s0, s1));
@@ -128,6 +153,14 @@ __device__ __forceinline__ __half2 u2h(uint32_t u) { return *reinterpret_cast<__
 __device__ __forceinline__ uint32_t fsh(uint32_t lo, uint32_t hi, int s) {
     return (uint32_t) ((((uint64_t) hi << 32) | (uint64_t) lo) >> s);
 }
+// the same for 0 <= s < 32: on AMD one funnel shift, v_alignbit_b32 at full rate (RDNA 3's 64-bit shift is half rate)
+__device__ __forceinline__ uint32_t fsh32(uint32_t lo, uint32_t hi, int s) {
+#if defined(STRATA_USE_HIP)
+    return __builtin_amdgcn_alignbit(hi, lo, (uint32_t) s);
+#else
+    return fsh(lo, hi, s);
+#endif
+}
 
 // Step p's state is the 16-bit window ending at bit S(p) of the tile's MSB-first bit stream (w: its 4 K2 words, K2 =
 // 2 K), wrapping around the tile: S(p) = (p + 1) K for an integer K, floor((p + 1) K2 / 2) for exllamav3 1.6's
@@ -136,14 +169,22 @@ __device__ __forceinline__ uint32_t fsh(uint32_t lo, uint32_t hi, int s) {
 // exllamav3's grouping per K (exl3_dq.cuh: dq8_aligned_*bits, dq8, dq4, dq2x2, dq8_half), which the steps' fixed
 // offsets keep within two words.  f[i]: steps 2i, 2i + 1 as FP16 values.
 // Step lane * 8 + j sits at tile row (lane & 3) * 2 + (j & 1) + 8 (j >> 1 & 1), column (lane >> 2) + 8 (j >> 2).
-template <int cb>
+// Pk: codebook 2 through decode2h_pk on AMD (the decode GEMV's; its states unmasked - it reads their low halves only)
+template <int cb, bool Pk = false>
 __device__ __forceinline__ void decode_states(const uint32_t (&s)[8], uint32_t (&f)[4]) {
+#if defined(STRATA_USE_HIP)
+    if constexpr (Pk && cb == 2) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) f[i] = h2u(decode2h_pk(s[2 * i], s[2 * i + 1]));
+        return;
+    }
+#endif
 #pragma unroll
     for (int i = 0; i < 4; ++i) f[i] = h2u(decode2h<cb>(s[2 * i] & 0xffffu, s[2 * i + 1] & 0xffffu));
 }
 // K = 4: the lane's steps end in its own word b (word lane), the first three reach into a (word lane - 1)
 __device__ __forceinline__ void states4(uint32_t a, uint32_t b, uint32_t (&s)[8]) {
-    const uint32_t x = fsh(b, a, 20);
+    const uint32_t x = fsh32(b, a, 20);
     s[0] = x >> 8;
     s[1] = x >> 4;
     s[2] = x;
@@ -160,11 +201,14 @@ __device__ __forceinline__ void states_group(const uint32_t* w, int p, uint32_t*
     const int b0 = (p + 257) * K - 16, b2 = b0 + (G - 1) * K + 16;
     const int i0 = b0 >> 5, i2 = (b2 - 1) >> 5, s2 = ((i2 + 1) << 5) - b2;
     const uint32_t a = w[i0 % NW], b = w[i2 % NW];
+    // (a : b) >> (s2 + j K): (a : b) >> s2 once (s2 < 32: its low word t, its high word h), then shifts of (h : t) by
+    // j K < 32 - funnel shifts under 32 only, the same words
+    const uint32_t t = fsh32(b, a, s2), h = a >> s2;
 #pragma unroll
-    for (int j = 0; j < G; ++j) s[G - 1 - j] = fsh(b, a, s2 + j * K);
+    for (int j = 0; j < G; ++j) s[G - 1 - j] = j == 0 ? t : fsh32(t, h, j * K);
 }
 // an integer K
-template <int K, int cb>
+template <int K, int cb, bool Pk = false>
 __device__ __forceinline__ void frag8_int(const uint32_t* w, int lane, uint32_t (&f)[4]) {
     const int p = lane * 8;
     uint32_t s[8];
@@ -174,7 +218,7 @@ __device__ __forceinline__ void frag8_int(const uint32_t* w, int lane, uint32_t 
         // the 8 windows overlap in one 32-bit window: steps p + j end 8 - 1 - j K bits apart
         constexpr int NW = 8 * K, per = 32 / (8 * K);   // lanes per word
         const int i1 = lane / per, i0 = (i1 + NW - 1) % NW;
-        const uint32_t b = fsh(w[i1], w[i0], (per - 1 - lane % per) * 8 * K);
+        const uint32_t b = fsh32(w[i1], w[i0], (per - 1 - lane % per) * 8 * K);
 #pragma unroll
         for (int j = 0; j < 8; ++j) s[j] = b >> ((7 - j) * K);
     } else if constexpr (K == 3) {
@@ -183,7 +227,7 @@ __device__ __forceinline__ void frag8_int(const uint32_t* w, int lane, uint32_t 
         const int b1 = (p + 257) * 3, b0 = b1 - 16, b2 = b1 + 21;
         const int i0 = b0 >> 5, i2 = (b2 - 1) >> 5, s2 = ((i2 + 1) << 5) - b2;
         const uint32_t a = w[i0 % NW], b = w[i2 % NW];
-        const uint32_t hi = fsh(b, a, s2), lo = fsh(b, a, s2 + 12);
+        const uint32_t hi = fsh32(b, a, s2), lo = fsh32(hi, a >> s2, 12);   // (s2 < 32; lo: (a : b) >> (s2 + 12))
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             s[7 - j] = hi >> (3 * j);
@@ -196,12 +240,12 @@ __device__ __forceinline__ void frag8_int(const uint32_t* w, int lane, uint32_t 
         states_group<K, 4>(w, p, s);
         states_group<K, 4>(w, p + 4, s + 4);
     }
-    decode_states<cb>(s, f);
+    decode_states<cb, Pk>(s, f);
 }
 // a half-integer K (K2 = 2 KA + 1, mul1): exllamav3's dq8_half.  The lane's steps start even, so their windows end at
 // S(p + 7) = (p / 2 + 4) K2 and then KA + 1, KA, KA + 1, ... bits earlier; four windows span 18 + 3 KA <= 27 bits, one
 // funnel shift of two words each (steps 4..7 from window 7's end, 0..3 from window 3's, 2 K2 bits earlier)
-template <int K2, int cb>
+template <int K2, int cb, bool Pk = false>
 __device__ __forceinline__ void frag8_half(const uint32_t* w, int lane, uint32_t (&f)[4]) {
     constexpr int KA = K2 / 2, NW = 4 * K2, span = 18 + 3 * KA;
     const int e7 = (lane * 4 + 4) * K2 + 128 * K2;   // one ring on: no negative bit index
@@ -210,22 +254,22 @@ __device__ __forceinline__ void frag8_half(const uint32_t* w, int lane, uint32_t
     for (int g = 0; g < 2; ++g) {
         const int e = e7 - (1 - g) * 2 * K2;
         const int hi = (e - 1) >> 5, lo = (e - span) >> 5, sh = ((hi + 1) << 5) - e;
-        const uint32_t x = fsh(w[hi % NW], w[lo % NW], sh);   // the window ending at e in the low bits
+        const uint32_t x = fsh32(w[hi % NW], w[lo % NW], sh);   // the window ending at e in the low bits (sh < 32)
         s[4 * g + 3] = x;
         s[4 * g + 2] = x >> (KA + 1);
         s[4 * g + 1] = x >> (2 * KA + 1);
         s[4 * g + 0] = x >> (3 * KA + 2);
     }
-    decode_states<cb>(s, f);
+    decode_states<cb, Pk>(s, f);
 }
 // K2 = 2 K: an even K2 is the integer K2 / 2, an odd one a half-integer K (mul1 only: exllamav3 has no other)
-template <int K2, int cb>
+template <int K2, int cb, bool Pk = false>
 __device__ __forceinline__ void frag8(const uint32_t* w, int lane, uint32_t (&f)[4]) {
     if constexpr ((K2 & 1) != 0) {
         static_assert(cb == 2 && K2 >= 3 && K2 <= 7, "a half-integer K: 1.5, 2.5 or 3.5, mul1");
-        frag8_half<K2, cb>(w, lane, f);
+        frag8_half<K2, cb, Pk>(w, lane, f);
     } else {
-        frag8_int<K2 / 2, cb>(w, lane, f);
+        frag8_int<K2 / 2, cb, Pk>(w, lane, f);
     }
 }
 
@@ -384,12 +428,53 @@ __device__ __forceinline__ void load_tiles(const uint32_t* __restrict__ tile0, s
 // one slice's fragment from the lane's words: K = 4 straight from the registers (the lane's steps end in its own word,
 // the first three reach into the previous lane's), other K (a half-integer one too) through the warp's stage (4 K2
 // words)
-template <int K2, int cb>
+template <int K2, int cb, bool Perm = false, bool Pk = false>
 __device__ __forceinline__ void slice_frags(const uint32_t (&w)[Words<K2>::R], uint32_t* st, int lane, uint32_t (&f)[4]) {
+#if defined(STRATA_USE_HIP) && (defined(__GFX10__) || defined(__GFX11__) || defined(__GFX12__))
+    if constexpr (Perm && K2 == 4) {
+        // K = 2 without the stage: lane l's steps are in words l / 2 and l / 2 - 1 (the tile's last for l < 2), which
+        // lanes 0-15 hold - v_permlane16 within a row of 16 lanes, v_permlanex16 from the other row for lanes 16-31;
+        // no LDS round trip a slice.  The same words, so the same states and bits
+        const uint32_t v = w[0];
+        const uint32_t a0 = __builtin_amdgcn_permlane16(v, v, 0x33221100u, 0x77665544u, false, false);
+        const uint32_t a1 = __builtin_amdgcn_permlanex16(v, v, 0xBBAA9988u, 0xFFEEDDCCu, false, false);
+        const uint32_t b0 = __builtin_amdgcn_permlane16(v, v, 0x221100FFu, 0x66554433u, false, false);
+        const uint32_t b1 = __builtin_amdgcn_permlanex16(v, v, 0xAA998877u, 0xEEDDCCBBu, false, false);
+        const bool row1 = lane >= 16;
+        const uint32_t b = fsh32(row1 ? a1 : a0, row1 ? b1 : b0, (1 - (lane & 1)) * 16);
+        uint32_t s[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) s[j] = b >> ((7 - j) * 2);
+        decode_states<cb>(s, f);
+        return;
+    }
+    if constexpr (Perm && (K2 & 1) != 0 && Words<K2>::R == 1) {
+        // a half-integer K without the stage: frag8_half's four words fetched from the lanes holding them (lane i
+        // holds word i) by ds_bpermute - no LDS write, no syncs.  The same words, so the same states and bits
+        constexpr int KA = K2 / 2, NW = 4 * K2, span = 18 + 3 * KA;
+        const int v = (int) w[0];
+        const int e7 = (lane * 4 + 4) * K2 + 128 * K2;   // (frag8_half's: one ring on, no negative bit index)
+        uint32_t s[8];
+#pragma unroll
+        for (int g = 0; g < 2; ++g) {
+            const int e = e7 - (1 - g) * 2 * K2;
+            const int hi = (e - 1) >> 5, lo = (e - span) >> 5, sh = ((hi + 1) << 5) - e;
+            const uint32_t whi = (uint32_t) __builtin_amdgcn_ds_bpermute((hi % NW) << 2, v);
+            const uint32_t wlo = (uint32_t) __builtin_amdgcn_ds_bpermute((lo % NW) << 2, v);
+            const uint32_t x = fsh32(whi, wlo, sh);   // (sh < 32)
+            s[4 * g + 3] = x;
+            s[4 * g + 2] = x >> (KA + 1);
+            s[4 * g + 1] = x >> (2 * KA + 1);
+            s[4 * g + 0] = x >> (3 * KA + 2);
+        }
+        decode_states<cb>(s, f);
+        return;
+    }
+#endif
     if constexpr (K2 == 8) {
         uint32_t s[8];
         states4(__shfl_sync(0xffffffffu, w[0], (lane + 31) & 31), w[0], s);
-        decode_states<cb>(s, f);
+        decode_states<cb, Pk>(s, f);
     } else {
         constexpr int W = Words<K2>::W, R = Words<K2>::R;
         __syncwarp();
@@ -397,7 +482,7 @@ __device__ __forceinline__ void slice_frags(const uint32_t (&w)[Words<K2>::R], u
         for (int r = 0; r < R; ++r)
             if (W % 32 == 0 || lane + 32 * r < W) st[lane + 32 * r] = w[r];
         __syncwarp();
-        frag8<K2, cb>(st, lane, f);
+        frag8<K2, cb, Pk>(st, lane, f);
     }
 }
 
@@ -423,6 +508,15 @@ constexpr int kMinBlocksMv = 2;
 #define EXL3_BOUNDS(n) __launch_bounds__(kThreads)
 #else
 #define EXL3_BOUNDS(n) __launch_bounds__(kThreads, n)
+#endif
+// HIP: the decode kernels' block_gemv (moe_*, win_*, and mv_kernel's for the dense matrices) inlined into the kernel.
+// Left to the compiler it can stay a call - it did in v1.1.52, and mv_kernel's still was in v1.1.57 - and a call's
+// arguments arrive in vector registers, so the block's activation count reads as per-lane and every `cc < nc` of the
+// token loop is a branch on the lane mask.  The same arithmetic, the same bits.
+#if defined(STRATA_USE_HIP)
+#define EXL3_DECODE_INLINE [[clang::always_inline]]
+#else
+#define EXL3_DECODE_INLINE
 #endif
 
 // the shared memory of a block_gemv block
@@ -466,7 +560,7 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
 #pragma unroll
         for (int s = 0; s < 8; ++s) {
             uint32_t f[4];
-            slice_frags<K2, cb>(wc[s], st, lane, f);
+            slice_frags<K2, cb, false, true>(wc[s], st, lane, f);   // (Pk: the decode GEMV's multiply)
 #if defined(EXL3_TC)
             uint32_t b0 = 0u, b1 = 0u;
             if (g < nc) {
@@ -618,7 +712,7 @@ __global__ void EXL3_BOUNDS(kMinBlocksMv<K2>) mv_kernel(const KBatch b) {
         if (J.xf != nullptr) x.f = J.xf + warp * J.xf_cs;
         else x.q = (const Q81*) ((const uint8_t*) J.xq + warp * J.xq_cs);
     }
-    block_gemv<K2, cb>(J.tr, J.ld, g * 8, k0, k1, x, J.suh, nc, sm);
+    EXL3_DECODE_INLINE block_gemv<K2, cb>(J.tr, J.ld, g * 8, k0, k1, x, J.suh, nc, sm);
     const float* bias = J.bias != nullptr ? J.bias + g * kCols : nullptr;
     if (J.S == 1) {
         if (warp < nc)
@@ -723,6 +817,16 @@ __device__ __forceinline__ void block_out(const float* red, const uint16_t* svh,
 #pragma unroll
     for (int i = 0; i < 4; ++i) dst[lane * 4 + i] = __fmul_rn(v[i], h2f(svh[lane * 4 + i]));
 }
+// ... the same into the lane's own 4 (the shaped kernels' gate in registers: the lane that makes them uses them)
+__device__ __forceinline__ void block_out_r(const float* red, const uint16_t* svh, float (&dst)[4]) {
+    const int lane = threadIdx.x & 31;
+    float v[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) v[i] = red[lane * 4 + i];
+    had128(v, lane);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) dst[i] = __fmul_rn(v[i], h2f(svh[lane * 4 + i]));
+}
 // ... the clamped swiglu ...
 __device__ __forceinline__ float swiglu(float gv, float uv, float limit) {
     if (limit > 0.0f) {
@@ -804,8 +908,8 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) moe_gate_up_kernel(const KMoe a) {
         return;
     }
 #else
-    block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, 0, a.n_embd, x,
-                      (const uint16_t*) (blob + a.suh[r]), 1, sm);
+    EXL3_DECODE_INLINE block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, 0, a.n_embd, x,
+                                         (const uint16_t*) (blob + a.suh[r]), 1, sm);
 #endif
     const size_t row = (size_t) ei * a.n_ff + g * kCols;
     if (warp == 0) block_out(sm.out, (const uint16_t*) (blob + a.svh[r]) + g * kCols, (r == 0 ? a.h : a.u) + row);
@@ -842,8 +946,8 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) moe_down_kernel(const KMoe a) {
             return;
         }
 #else
-        block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[2]), a.n_embd / 16, g * 8, 0, a.n_ff, x,
-                          (const uint16_t*) (blob + a.suh[2]), 1, sm);
+        EXL3_DECODE_INLINE block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[2]), a.n_embd / 16, g * 8, 0, a.n_ff, x,
+                                             (const uint16_t*) (blob + a.suh[2]), 1, sm);
 #endif
         if (warp == 0) block_out(sm.out, (const uint16_t*) (blob + a.svh[2]) + g * kCols, part);
     } else if (threadIdx.x < kCols) {
@@ -928,8 +1032,8 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_gu_kernel(const KWin a) {
             });
         else if (warp < nc)
 #else
-        block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, 0, a.n_embd, x,
-                          (const uint16_t*) (blob + a.suh[r]), nc, sm);
+        EXL3_DECODE_INLINE block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, 0, a.n_embd, x,
+                                             (const uint16_t*) (blob + a.suh[r]), nc, sm);
         if (warp < nc)
 #endif
             block_out(sm.out + warp * kCols, (const uint16_t*) (blob + a.svh[r]) + g * kCols,
@@ -969,8 +1073,8 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_down_kernel(const KWin a) {
             });
         else if (warp < nc)
 #else
-        block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[2]), a.n_embd / 16, g * 8, 0, a.n_ff, x,
-                          (const uint16_t*) (blob + a.suh[2]), nc, sm);
+        EXL3_DECODE_INLINE block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[2]), a.n_embd / 16, g * 8, 0, a.n_ff, x,
+                                             (const uint16_t*) (blob + a.suh[2]), nc, sm);
         if (warp < nc)
 #endif
             block_out(sm.out + warp * kCols, (const uint16_t*) (blob + a.svh[2]) + g * kCols,
@@ -1949,18 +2053,35 @@ __global__ void __launch_bounds__(kThreads) set_mix_kernel(const KSetMix a, KMix
 // B 16 activations' slice from xb (col-major: an activation's inputs in a row), D stored col-major into out - the same
 // operands as gfx11's, the fragments loaded by the library instead of by hand (wt's pitch 12 words: wmma's ldm is a
 // multiple of 8 halves; the 8 rows a store takes stay on distinct banks).  wmma_now(): sm_7x unless
-// STRATA_EXL3_WMMA=0 (MAYA_EXL3_WMMA=0).
+// MAYA_EXL3_WMMA=0.
 constexpr int kXS = kCols + 8;   // an activation's pitch in xb (halves: 2-way LDS reads)
 #if defined(STRATA_USE_HIP)
 constexpr int kWtP = 9;          // wt's pitch, words a decoded output row (8 + 1: banks)
 #else
 constexpr int kWtP = 12;
 #endif
+// gfx11's own pitch: 12 words, so a decoded output row is two 16-byte loads (ds_load_b128) instead of eight single
+// words, its rows still on distinct banks for the eight a phase takes
+constexpr int kWtP11 = 12;
 template <int K2, int NR>
 struct WmmaSmem {   // (out, xb and wt at the same offsets for every K2: the mixed kernel keeps one for all classes)
+    static constexpr bool kUnion = false;
     float out[NR * kCols];
     __half xb[2 * NR * kXS];
-    uint32_t wt[kWarps * 16 * kWtP];   // a warp's decoded tile by output, 8 words a row (kWtP apart)
+    uint32_t wt[kWarps * 16 * (kWtP > kWtP11 ? kWtP : kWtP11)];   // a warp's decoded tile by output, 8 words a row
+    uint32_t stage[kWarps * 4 * K2];
+};
+// gfx11's shaped kernels: out over xb (out is written only once every warp has read xb's last chunk), so a block's
+// LDS no longer caps the waves a SIMD below what its registers allow (a 32-row gate / up block: 57 -> 41 KB, with the
+// gate in registers 24 KB; two blocks a WGP were 4 waves a SIMD)
+template <int K2, int NR>
+struct WmmaSmem11 {
+    static constexpr bool kUnion = true;
+    union {
+        float out[NR * kCols];
+        __half xb[2 * NR * kXS];
+    };
+    uint32_t wt[kWarps * 16 * kWtP11];
     uint32_t stage[kWarps * 4 * K2];
 };
 #if defined(STRATA_USE_HIP) && defined(__GFX11__)
@@ -2072,7 +2193,7 @@ __device__ void rdna4_block_wmma(const uint32_t* tr, int ld, int tc0, int k0, in
 
 // block_gemv for nc <= NR activations (warp w loads activations w, w + 8, ..: in[j] the one at w + 8 j):
 // sm.out[n * kCols + o]
-template <int K2, int cb, int KS, int NR, class Input, class Smem>
+template <int K2, int cb, int KS, int NR, bool Perm = false, bool OneXs = false, class Input, class Smem>
 __device__ void block_gemm_w(const uint32_t* __restrict__ tr, int ld, int tc0, int k0, int k1, const Input (&in)[NR / 8],
                              const uint16_t* __restrict__ suh, int nc, Smem& sm) {
 #if defined(EXL3_WMMA_RDNA4)
@@ -2084,14 +2205,14 @@ __device__ void block_gemm_w(const uint32_t* __restrict__ tr, int ld, int tc0, i
     const size_t sstride = (size_t) ld * W;
     const uint32_t* tile = tr + ((size_t) (k0 / 16) * ld + tc0 + warp) * W;
     uint32_t* st = sm.stage + warp * W;
-    uint32_t* wt = sm.wt + warp * 16 * 9;
+    uint32_t* wt = sm.wt + warp * 16 * kWtP11;
     const int nq = (k1 - k0) / kCols;
     uint32_t wc[8][R], wn[8][R];
-    float xv[NJ][4], xs[NJ][4];
+    float xv[NJ][4], xs[OneXs ? 1 : NJ][4];   // (OneXs: suh is the same for every row - one copy, its registers freed)
     load_tiles<K2>(tile, sstride, lane, wc);
 #pragma unroll
     for (int j = 0; j < NJ; ++j)
-        if (warp + 8 * j < nc) chunk_load(in[j], suh, k0, lane, xv[j], xs[j]);
+        if (warp + 8 * j < nc) chunk_load(in[j], suh, k0, lane, xv[j], xs[OneXs ? 0 : j]);
     exl3_f8 c[NB];
 #pragma unroll
     for (int b = 0; b < NB; ++b) c[b] = exl3_f8{};
@@ -2099,35 +2220,35 @@ __device__ void block_gemm_w(const uint32_t* __restrict__ tr, int ld, int tc0, i
         __half* xq = sm.xb + (q & 1) * (NR * kXS);
 #pragma unroll
         for (int j = 0; j < NJ; ++j)
-            if (warp + 8 * j < nc) chunk_store(xv[j], xs[j], lane, xq + (warp + 8 * j) * kXS);
+            if (warp + 8 * j < nc) chunk_store(xv[j], xs[OneXs ? 0 : j], lane, xq + (warp + 8 * j) * kXS);
         __syncthreads();
         if (q + 1 < nq) {
             load_tiles<K2>(tile + (size_t) (q + 1) * 8 * sstride, sstride, lane, wn);
 #pragma unroll
             for (int j = 0; j < NJ; ++j)
-                if (warp + 8 * j < nc) chunk_load(in[j], suh, k0 + (q + 1) * kCols, lane, xv[j], xs[j]);
+                if (warp + 8 * j < nc) chunk_load(in[j], suh, k0 + (q + 1) * kCols, lane, xv[j], xs[OneXs ? 0 : j]);
         }
 #pragma unroll
         for (int s = 0; s < 8; ++s) {
             uint32_t f[4];
-            slice_frags<K2, cb>(wc[s], st, lane, f);
+            slice_frags<K2, cb, Perm>(wc[s], st, lane, f);
             // f: outputs g (f[0], f[1]) and g + 8 (f[2], f[3]), inputs 2t, 2t + 1 (f[0], f[2]) / 2t + 8, 2t + 9
-            wt[g * 9 + t] = f[0];
-            wt[g * 9 + 4 + t] = f[1];
-            wt[(g + 8) * 9 + t] = f[2];
-            wt[(g + 8) * 9 + 4 + t] = f[3];
+            wt[g * kWtP11 + t] = f[0];
+            wt[g * kWtP11 + 4 + t] = f[1];
+            wt[(g + 8) * kWtP11 + t] = f[2];
+            wt[(g + 8) * kWtP11 + 4 + t] = f[3];
             __syncwarp();
-            exl3_u8 aw;
-#pragma unroll
-            for (int i = 0; i < 8; ++i) aw[i] = wt[m * 9 + i];
+            const uint4* wr = reinterpret_cast<const uint4*>(wt + m * kWtP11);   // (two ds_load_b128: 16-byte rows)
+            const uint4 w0 = wr[0], w1 = wr[1];
+            const exl3_u8 aw = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
             __syncwarp();   // (wt: the next slice's)
             const exl3_h16 a = __builtin_bit_cast(exl3_h16, aw);
 #pragma unroll
             for (int b = 0; b < NB; ++b) {   // (activations past nc: whatever xb holds - their outputs are not written)
-                const uint32_t* xr = reinterpret_cast<const uint32_t*>(xq + (b * 16 + m) * kXS + s * 16);
-                exl3_u8 bw;
-#pragma unroll
-                for (int i = 0; i < 8; ++i) bw[i] = xr[i];
+                // (an activation's 16 inputs: two ds_load_b128 - xb's rows are 272 bytes, a slice 32)
+                const uint4* xr = reinterpret_cast<const uint4*>(xq + (b * 16 + m) * kXS + s * 16);
+                const uint4 x0 = xr[0], x1 = xr[1];
+                const exl3_u8 bw = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
                 c[b] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, __builtin_bit_cast(exl3_h16, bw), c[b]);
             }
         }
@@ -2136,6 +2257,7 @@ __device__ void block_gemm_w(const uint32_t* __restrict__ tr, int ld, int tc0, i
 #pragma unroll
             for (int r = 0; r < R; ++r) wc[s][r] = wn[s][r];
     }
+    if constexpr (Smem::kUnion) __syncthreads();   // (out over xb: every warp past its last chunk)
 #pragma unroll
     for (int b = 0; b < NB; ++b)
         if (b * 16 + m < nc)
@@ -2279,12 +2401,38 @@ __device__ void block_gemm_w(const uint32_t* __restrict__ tr, int ld, int tc0, i
 
 // a block's rows [row, row + nc) of one expert (gemm(r, in): part r's NR-row product, its out): gate / up into h
 // through the clamped swiglu, or down into y - hip_set_kernel's arithmetic around the product
-template <int NR, bool gate_up, class Gemm>
+template <int NR, bool gate_up, bool GateReg = false, class Gemm>
 __device__ __forceinline__ void set_rows_w(const SetArgs& a, Gemm&& gemm, const uint16_t* svh0, const uint16_t* svh1,
                                            const uint16_t* svh2, const float* x, int ldx, const int* idx, uint16_t* h,
                                            int ldh, float* y, int ldy, int row, int nc, int g, float* gate) {
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    if constexpr (gate_up) {
+    if constexpr (gate_up && GateReg) {   // (the gate in the lane's registers, no LDS for it)
+        Xin in[NR / 8];
+#pragma unroll
+        for (int j = 0; j < NR / 8; ++j)
+            if (warp + 8 * j < nc) in[j].f = x + (size_t) idx[row + warp + 8 * j] * ldx;
+        float gr[NR / kWarps][4];
+        const float* o = gemm(0, in);
+#pragma unroll
+        for (int j = 0; j < NR / kWarps; ++j)
+            if (warp + kWarps * j < nc) block_out_r(o + (warp + kWarps * j) * kCols, svh0 + g * kCols, gr[j]);
+        __syncthreads();
+        o = gemm(1, in);
+#pragma unroll
+        for (int j = 0; j < NR / kWarps; ++j) {
+            const int rr = warp + kWarps * j;
+            if (rr >= nc) continue;
+            float v[4];
+            for (int i = 0; i < 4; ++i) v[i] = o[rr * kCols + lane * 4 + i];
+            had128(v, lane);
+            for (int i = 0; i < 4; ++i) {
+                const int cc = lane * 4 + i;
+                const float up = v[i] * h2f(svh1[g * kCols + cc]);
+                h[(size_t) (row + rr) * ldh + g * kCols + cc] =
+                    __half_as_ushort(__float2half_rn(swiglu(gr[j][i], up, a.limit)));
+            }
+        }
+    } else if constexpr (gate_up) {
         Xin in[NR / 8];
 #pragma unroll
         for (int j = 0; j < NR / 8; ++j)
@@ -2315,15 +2463,19 @@ __device__ __forceinline__ void set_rows_w(const SetArgs& a, Gemm&& gemm, const 
     }
 }
 
-template <int K2, int cb, bool gate_up, int NR>
-__global__ void __launch_bounds__(kThreads) wmma_set_kernel(SetArgs a, const float* x, int ldx, const int* idx,
-                                                         uint16_t* h, int ldh, float* y, int ldy) {
+template <int K2, int cb, bool gate_up, int NR, bool Perm, bool Shaped = false>
+__device__ __forceinline__ void wmma_set_body(const SetArgs& a, const float* x, int ldx, const int* idx, uint16_t* h,
+                                              int ldh, float* y, int ldy) {
 #if defined(EXL3_WMMA_RDNA4)
     __shared__ __align__(16) Rdna4Smem<NR> sm;
 #else
-    __shared__ __align__(32) WmmaSmem<K2, NR> sm;   // (wmma: 256-bit aligned operands)
+    // (wmma: 256-bit aligned operands; the shaped kernels: out over xb)
+    __shared__ __align__(32) typename std::conditional<Shaped, WmmaSmem11<K2, NR>, WmmaSmem<K2, NR>>::type sm;
 #endif
-    __shared__ float gate[NR * kCols];
+    // the shaped kernels' 32-row blocks: the gate in registers (-13 to -15 % kernel time from 128 rows a set); their
+    // 16-row blocks keep it in LDS (in registers 1-8 rows a set lost up to 2 %)
+    constexpr bool kGateReg = Shaped && NR >= 32;
+    __shared__ float gate[(Shaped && (kGateReg || !gate_up)) ? 1 : NR * kCols];
     const int e = blockIdx.z, g = blockIdx.y;
     const int start = a.bounds[e], end = a.bounds[e + 1];
     const int row = start - a.row0 + (int) blockIdx.x * NR;
@@ -2332,13 +2484,34 @@ __global__ void __launch_bounds__(kThreads) wmma_set_kernel(SetArgs a, const flo
     const uint8_t* blob = a.wbase + (size_t) e * a.stride;
     auto gemm = [&](int r, const auto& in) -> const float* {
         const int ld = r < 2 ? a.n_ff / 16 : a.n_embd / 16, k1 = r < 2 ? a.n_embd : a.n_ff;
-        block_gemm_w<K2, cb, K2, NR>((const uint32_t*) (blob + a.lay.trellis[r]), ld, g * 8, 0, k1, in,
-                                     (const uint16_t*) (blob + a.lay.suh[r]), nc, sm);
+        block_gemm_w<K2, cb, K2, NR, Perm, Shaped>((const uint32_t*) (blob + a.lay.trellis[r]), ld, g * 8, 0, k1, in,
+                                           (const uint16_t*) (blob + a.lay.suh[r]), nc, sm);
         return sm.out;
     };
-    set_rows_w<NR, gate_up>(a, gemm, (const uint16_t*) (blob + a.lay.svh[0]), (const uint16_t*) (blob + a.lay.svh[1]),
-                            (const uint16_t*) (blob + a.lay.svh[2]), x, ldx, idx, h, ldh, y, ldy, row, nc, g, gate);
+    set_rows_w<NR, gate_up, kGateReg>(a, gemm, (const uint16_t*) (blob + a.lay.svh[0]),
+                                      (const uint16_t*) (blob + a.lay.svh[1]), (const uint16_t*) (blob + a.lay.svh[2]),
+                                      x, ldx, idx, h, ldh, y, ldy, row, nc, g, gate);
 }
+template <int K2, int cb, bool gate_up, int NR, bool Perm = false>
+__global__ void __launch_bounds__(kThreads) wmma_set_kernel(SetArgs a, const float* x, int ldx, const int* idx,
+                                                         uint16_t* h, int ldh, float* y, int ldy) {
+    wmma_set_body<K2, cb, gate_up, NR, Perm>(a, x, ldx, idx, h, ldh, y, ldy);
+}
+#if defined(STRATA_USE_HIP)
+// gfx11's shaped prompt kernels (wmma_shape): the same, with the compiler fitting the registers to 8 waves a SIMD
+template <int K2, int cb, bool gate_up, int NR, bool Perm>
+__global__ void __launch_bounds__(kThreads) __attribute__((amdgpu_waves_per_eu(8)))
+wmma_set8_kernel(SetArgs a, const float* x, int ldx, const int* idx, uint16_t* h, int ldh, float* y, int ldy) {
+    wmma_set_body<K2, cb, gate_up, NR, Perm, true>(a, x, ldx, idx, h, ldh, y, ldy);
+}
+// ... 64-row blocks fitted to 6 waves a SIMD: their LDS (~41 KB) lets three blocks a WGP run, 6 waves, and the decoded
+// tile feeds four activation tiles (-7 to -12 % kernel time from 128 rows a set against 32-row blocks at 8 waves)
+template <int K2, int cb, bool gate_up, int NR, bool Perm>
+__global__ void __launch_bounds__(kThreads) __attribute__((amdgpu_waves_per_eu(6)))
+wmma_set6_kernel(SetArgs a, const float* x, int ldx, const int* idx, uint16_t* h, int ldh, float* y, int ldy) {
+    wmma_set_body<K2, cb, gate_up, NR, Perm, true>(a, x, ldx, idx, h, ldh, y, ldy);
+}
+#endif
 
 template <int cb, bool gate_up, int NR>
 __global__ void __launch_bounds__(kThreads) wmma_set_mix_kernel(SetArgs a, KMix mx, const float* x, int ldx,
@@ -2419,14 +2592,14 @@ static bool hip_scalar_set(const SetArgs& a, const float* x, int ldx, const int*
                             float* y, int ldy, cudaStream_t s) {
     // Only the tested integer 3/4-bit mul1 layouts. Mixed and other layouts retain their original path.
     if constexpr ((K2 == 6 || K2 == 8) && cb == 2) {
-        const int mode = hip_scalar::mode(hip_scalar_env("STRATA_EXL3_HIP_SCALAR_ROWS",
+        const int mode = hip_scalar::mode(hip_scalar_env("MAYA_EXL3_HIP_SCALAR_ROWS",
             "MAYA_EXL3_HIP_SCALAR_ROWS", "EXL3_HIP_SCALAR_ROWS"));
         if (mode == 8 || !hip_scalar_device()) return false;
         int gu_min = 48, down_min = 128;
         if (mode == -1) {
-            gu_min = hip_scalar::cutoff(hip_scalar_env("STRATA_EXL3_HIP_SCALAR_GU_MIN_ROWS",
+            gu_min = hip_scalar::cutoff(hip_scalar_env("MAYA_EXL3_HIP_SCALAR_GU_MIN_ROWS",
                 "MAYA_EXL3_HIP_SCALAR_GU_MIN_ROWS", "EXL3_HIP_SCALAR_GU_MIN_ROWS"), gu_min);
-            down_min = hip_scalar::cutoff(hip_scalar_env("STRATA_EXL3_HIP_SCALAR_DOWN_MIN_ROWS",
+            down_min = hip_scalar::cutoff(hip_scalar_env("MAYA_EXL3_HIP_SCALAR_DOWN_MIN_ROWS",
                 "MAYA_EXL3_HIP_SCALAR_DOWN_MIN_ROWS", "EXL3_HIP_SCALAR_DOWN_MIN_ROWS"), down_min);
         }
         const int nr = hip_scalar::rows(mode, GU, a.max_rows, gu_min, down_min);
@@ -2641,31 +2814,67 @@ int sm_count() {
     return std::max(1, sms);
 }
 
-// Whether the current device decodes with v1.1.8's kernels (exl3_legacy.cu): NVIDIA before sm_80, where this file's
-// tiles run on the CUDA cores and were slower; STRATA_GLM_EXL3_DECODE=legacy | new picks one on any GPU (A/B).  The
-// token path and the verify windows take the same family on a device, so a window stays bit for bit its token path.
-// Asked once per device.
-bool use_legacy() {
-#if defined(STRATA_USE_HIP)
-    return false;
-#else
-    static std::atomic<int> cache[64];   // 0 not asked, 1 v1.1.8's kernels, 2 this file's
-    int dev = 0;
-    cudaGetDevice(&dev);
-    if (dev < 0 || dev >= 64) return false;
-    int c = cache[dev].load(std::memory_order_acquire);
+// A device's decode kernels: 1 v1.1.8's (exl3_legacy.cu), 2 this file's, 3 v1.1.8's with the weights decoded in F32
+// (legacy_f32).  NVIDIA before sm_80 takes v1.1.8's, where this file's tiles run on the CUDA cores and were slower;
+// MAYA_GLM_EXL3_DECODE=legacy | new | legacy-f32 picks one on every GPU (A/B), MAYA_GLM_EXL3_DECODE<n> on CUDA<n>
+// alone (its ordinal as this process sees it), over the first: a Pascal expert helper on legacy-f32 beside an RTX 20
+// trunk on legacy.  Neither set: the engine's default for the device (prefer_legacy_f32), else by its architecture.
+// legacy-f32 on sm_6x only: its kernels are built for Pascal alone (exl3_legacy.cu's EXL3_F32_KERNEL), so sm_70 and
+// newer take v1.1.8's FP16 decode for it, the same bits.  The token path and the verify windows take the same family
+// on a device, so a window stays bit for bit its token path.  Asked once per device.
+#if !defined(STRATA_USE_HIP)
+// a decode-kernel name (MAYA_GLM_EXL3_DECODE's values) -> its number; 0 for none of them (unset, empty, other)
+int decode_choice(const char* v) {
+    return v == nullptr                         ? 0
+           : std::strcmp(v, "legacy") == 0     ? 1
+           : std::strcmp(v, "new") == 0        ? 2
+           : std::strcmp(v, "legacy-f32") == 0 ? 3
+                                               : 0;
+}
+// an explicit choice for CUDA<dev>: MAYA_GLM_EXL3_DECODE<dev>, else MAYA_GLM_EXL3_DECODE (0: none)
+int decode_env(int dev) {
+    const int c = decode_choice(std::getenv(("MAYA_GLM_EXL3_DECODE" + std::to_string(dev)).c_str()));
+    return c != 0 ? c : decode_choice(std::getenv("MAYA_GLM_EXL3_DECODE"));
+}
+std::atomic<int> g_decode_cache[64];     // a device's kernels once asked (0: not asked)
+std::atomic<int> g_decode_default[64];   // the engine's default where no setting picks (0: by architecture)
+
+int decode_kernels_of(int dev) {
+    if (dev < 0 || dev >= 64) return 2;
+    int c = g_decode_cache[dev].load(std::memory_order_acquire);
     if (c == 0) {
         int major = 0;
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
-        const char* v = std::getenv("STRATA_GLM_EXL3_DECODE");
-        c = v != nullptr && std::strcmp(v, "legacy") == 0 ? 1 : v != nullptr && std::strcmp(v, "new") == 0 ? 2
-            : major < 8                                    ? 1
-                                                           : 2;
-        if (c == 1) std::fprintf(stderr, "exl3: CUDA%d decodes with v1.1.8's kernels\n", dev);
-        cache[dev].store(c, std::memory_order_release);
+        c = decode_env(dev);
+        if (c == 0) c = g_decode_default[dev].load(std::memory_order_acquire);
+        if (c == 0) c = major < 8 ? 1 : 2;
+        const bool f32_off = c == 3 && major >= 7;   // (legacy-f32's kernels: sm_6x's only)
+        if (f32_off) c = 1;
+        int first = 0;   // (two threads asking at once: the first answer stands, printed once)
+        if (!g_decode_cache[dev].compare_exchange_strong(first, c, std::memory_order_acq_rel)) return first;
+        if (f32_off)
+            std::fprintf(stderr, "exl3: CUDA%d decodes with v1.1.8's kernels (legacy-f32 is built for sm_6x only; the "
+                                 "same bits)\n", dev);
+        else if (c == 1) std::fprintf(stderr, "exl3: CUDA%d decodes with v1.1.8's kernels\n", dev);
+        if (c == 3) std::fprintf(stderr, "exl3: CUDA%d decodes with v1.1.8's kernels, FP32 decode\n", dev);
     }
-    return c == 1;
+    return c;
+}
 #endif
+// the current device's
+int decode_kernels() {
+#if defined(STRATA_USE_HIP)
+    return 2;
+#else
+    int dev = 0;
+    cudaGetDevice(&dev);
+    return decode_kernels_of(dev);
+#endif
+}
+// Whether the current device decodes with v1.1.8's kernels (FP16 or F32 decode)
+bool use_legacy() {
+    const int c = decode_kernels();
+    return c == 1 || c == 3;
 }
 
 // the blocks of mv_kernel<K2> an SM of the current device keeps at once (its registers and shared memory), asked once
@@ -2755,6 +2964,32 @@ int mv_cols(const Mat& m) {
     if (S <= 0) return 0;
     if (S == 1) return kTok;
     return (int) std::max<size_t>(1, std::min<size_t>(kTok, kPartFloats / ((size_t) S * m.n)));
+}
+
+bool legacy_f32() { return decode_kernels() == 3; }
+
+bool prefer_legacy_f32(int dev) {
+#if defined(STRATA_USE_HIP)
+    (void) dev;
+    return false;
+#else
+    if (dev < 0 || dev >= 64) return false;
+    if (decode_env(dev) == 0) g_decode_default[dev].store(3, std::memory_order_release);
+    return decode_kernels_of(dev) == 3;
+#endif
+}
+
+void legacy_decode_table(int cb, bool f32, float* d_out, cudaStream_t s) {
+#if !defined(STRATA_USE_HIP)
+    int dev = 0, major = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+    legacy::decode_table(cb, f32 && major < 7, d_out, s);   // (the F32 decode is built for sm_6x only)
+#else
+    (void) cb, (void) f32, (void) d_out, (void) s;
+    std::fprintf(stderr, "exl3 legacy_decode_table: v1.1.8's kernels are NVIDIA's only\n");
+    g_launch_errors.fetch_add(1, std::memory_order_relaxed);
+#endif
 }
 
 int launch_errors() {
@@ -3113,7 +3348,7 @@ static bool wmma_now() {
     return known[dev] == 2;
 #else
     // sm_7x: the Volta / Turing wmma kernels (sm_80 and later take the mma.m16n8k16 ones)
-    static const bool off = std::getenv("STRATA_EXL3_WMMA") != nullptr && std::atoi(std::getenv("STRATA_EXL3_WMMA")) == 0;
+    static const bool off = std::getenv("MAYA_EXL3_WMMA") != nullptr && std::atoi(std::getenv("MAYA_EXL3_WMMA")) == 0;
     static int known[64];
     int dev = 0;
     cudaGetDevice(&dev);
@@ -3142,8 +3377,52 @@ static void with_rows(F&& f) {   // (f(std::integral_constant<int, wmma_rows()>{
     f(std::integral_constant<int, 16>{});   // (sm_7x: 32 rows' gate/up block is over the 48 KB of static shared memory)
 #endif
 }
+// gfx11 (an RX 7900 XTX, DeepSeek-V4.1's experts): K2 4 and 5 (K = 2 and 2.5) with their tile words moved between
+// lanes (permlane / ds_bpermute, no LDS stage), fitted to 8 waves a SIMD, 32 rows a block once a set has 64 rows
+// (-17 to -18.5 % kernel time from 128 rows a set, none lost below; the freed registers let 32 rows and 8 waves fit
+// together), and their LDS cut to let those waves run (out over xb, a 32-row block's gate in registers: another -13 to
+// -15 %); from 128 rows a set, 64-row blocks at 6 waves (another -7 / -12 % at K2 4 / 5).  The same bits.  Other K2,
+// other GPUs, EXL3_WMMA_ROWS set or EXL3_WMMA_SHAPE=0: the uniform blocks
+static bool wmma_shape() {
+#if defined(STRATA_USE_HIP)
+    static const bool off = std::getenv("EXL3_WMMA_ROWS") != nullptr ||
+                            (std::getenv("EXL3_WMMA_SHAPE") != nullptr && std::atoi(std::getenv("EXL3_WMMA_SHAPE")) == 0);
+    static signed char known[64] = {};
+    int dev = -1;
+    cudaGetDevice(&dev);
+    if (off || dev < 0 || dev >= 64) return false;
+    if (known[dev] == 0) {
+        cudaDeviceProp p;
+        known[dev] = cudaGetDeviceProperties(&p, dev) == cudaSuccess && std::strncmp(p.gcnArchName, "gfx11", 5) == 0
+                         ? 1
+                         : -1;
+    }
+    return known[dev] == 1;
+#else
+    return false;
+#endif
+}
 template <int K2, int cb> struct RunWmmaGateUp {
     static void run(const SetArgs& a, const float* x, int ldx, const int* idx, uint16_t* h, int ldh, cudaStream_t s) {
+#if defined(STRATA_USE_HIP)
+        if constexpr (K2 == 4 || K2 == 5)
+            if (wmma_shape()) {
+                auto go = [&](auto nr, auto w6) {
+                    constexpr int NR = decltype(nr)::value;
+                    const dim3 grid((a.max_rows + NR - 1) / NR, a.n_ff / kCols, a.n_exp);
+                    if constexpr (decltype(w6)::value)
+                        wmma_set6_kernel<K2, cb, true, NR, true><<<grid, kThreads, 0, s>>>(a, x, ldx, idx, h, ldh,
+                                                                                            nullptr, 0);
+                    else
+                        wmma_set8_kernel<K2, cb, true, NR, true><<<grid, kThreads, 0, s>>>(a, x, ldx, idx, h, ldh,
+                                                                                            nullptr, 0);
+                };
+                if (a.max_rows >= 128) go(std::integral_constant<int, 64>{}, std::true_type{});
+                else if (a.max_rows >= 64) go(std::integral_constant<int, 32>{}, std::false_type{});
+                else go(std::integral_constant<int, 16>{}, std::false_type{});
+                return;
+            }
+#endif
         with_rows([&](auto nr) {
             constexpr int NR = decltype(nr)::value;
             wmma_set_kernel<K2, cb, true, NR><<<dim3((a.max_rows + NR - 1) / NR, a.n_ff / kCols, a.n_exp), kThreads, 0,
@@ -3153,6 +3432,25 @@ template <int K2, int cb> struct RunWmmaGateUp {
 };
 template <int K2, int cb> struct RunWmmaDown {
     static void run(const SetArgs& a, const uint16_t* h, int ldh, float* y, int ldy, cudaStream_t s) {
+#if defined(STRATA_USE_HIP)
+        if constexpr (K2 == 4 || K2 == 5)
+            if (wmma_shape()) {
+                auto go = [&](auto nr, auto w6) {
+                    constexpr int NR = decltype(nr)::value;
+                    const dim3 grid((a.max_rows + NR - 1) / NR, a.n_embd / kCols, a.n_exp);
+                    if constexpr (decltype(w6)::value)
+                        wmma_set6_kernel<K2, cb, false, NR, true><<<grid, kThreads, 0, s>>>(
+                            a, nullptr, 0, nullptr, const_cast<uint16_t*>(h), ldh, y, ldy);
+                    else
+                        wmma_set8_kernel<K2, cb, false, NR, true><<<grid, kThreads, 0, s>>>(
+                            a, nullptr, 0, nullptr, const_cast<uint16_t*>(h), ldh, y, ldy);
+                };
+                if (a.max_rows >= 128) go(std::integral_constant<int, 64>{}, std::true_type{});
+                else if (a.max_rows >= 64) go(std::integral_constant<int, 32>{}, std::false_type{});
+                else go(std::integral_constant<int, 16>{}, std::false_type{});
+                return;
+            }
+#endif
         with_rows([&](auto nr) {
             constexpr int NR = decltype(nr)::value;
             wmma_set_kernel<K2, cb, false, NR><<<dim3((a.max_rows + NR - 1) / NR, a.n_embd / kCols, a.n_exp), kThreads,

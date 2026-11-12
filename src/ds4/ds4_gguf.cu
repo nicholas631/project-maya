@@ -4,6 +4,7 @@
 
 #include "ds4_iq.cuh"
 #include "ds4_numerics.cuh"
+#include "ds4_par_exp.h"   // (DS4_LANE_PARITY: the CPU lane's MXFP4 rows reproduce this SwiGLU bit for bit)
 
 #include <cuda_fp16.h>
 #if !defined(STRATA_USE_HIP)
@@ -349,7 +350,7 @@ bool lane_parity_on() {
     return false;   // (an AMD build keeps its own sums: the parity rows are the CUDA kernels', not run on AMD yet)
 #else
     static const bool env = [] {
-        const char* v = std::getenv("STRATA_DS4_LANE_PARITY");
+        const char* v = std::getenv("MAYA_DS4_LANE_PARITY");
         if (v == nullptr) v = std::getenv("DS4_LANE_PARITY");
         return v != nullptr && std::atoi(v) != 0;
     }();
@@ -772,6 +773,7 @@ struct MxArgs {
     const float* xd;
     const int8_t* hq;   // h rounded to int8, row e = the entry, rows of n_ff
     const float* hd;
+    int pexp;           // (DS4_LANE_PARITY) the SwiGLU's exp in plain IEEE operations, as the CPU lane's rows
 };
 
 __device__ __forceinline__ bool mx_group(const MxArgs& a, int grp, const uint8_t*& blob, int& m0, int& m1) {
@@ -853,7 +855,9 @@ __global__ void __launch_bounds__(kThreads) mx_gate_up_kernel(const MxArgs a) {
         for (int i = 0; i < NE; ++i)
             if (i < ne) {
                 const float gv = warp_sum(ag[i]), uv = warp_sum(au[i]);
-                if (lane == 0) a.h[(size_t) es[i] * a.n_ff + row] = swiglu(gv, uv, a.limit);
+                if (lane == 0)
+                    a.h[(size_t) es[i] * a.n_ff + row] =
+                        a.pexp ? strata::ds4::par::swiglu_portable(gv, uv, a.limit) : swiglu(gv, uv, a.limit);
             }
     }
 }
@@ -1308,11 +1312,11 @@ __global__ void __launch_bounds__(kThreads) mx_set_wmma_kernel(const SetK a) {
         }
 }
 #endif
-// sm_70 and later (WMMA F16) / AMD gfx11, gfx12 (wave32 WMMA); STRATA_DS4_NO_TC=1 keeps the F32 kernel - per device
+// sm_70 and later (WMMA F16) / AMD gfx11, gfx12 (wave32 WMMA); MAYA_DS4_NO_TC=1 keeps the F32 kernel - per device
 // (the GPUs of a run need not be of one generation: a card before sm_70 beside newer ones keeps its F32 kernel)
 bool tc_ok() {
     static const bool off = [] {
-        const char* v = std::getenv("STRATA_DS4_NO_TC");
+        const char* v = std::getenv("MAYA_DS4_NO_TC");
         return v != nullptr && v[0] == '1';
     }();
     static std::atomic<int> known[64];   // 0: not asked yet, 1: no, 2: yes
@@ -1385,7 +1389,7 @@ bool prepare(cudaStream_t s) { return scratch(s) != nullptr; }
 namespace {
 std::atomic<int> g_q8_mode{-1};   // (tests: q8_mode)
 bool q8_env(const char* name) {   // (unset: on)
-    const char* v = std::getenv((std::string("STRATA_") + name).c_str());
+    const char* v = std::getenv((std::string("MAYA_") + name).c_str());
     if (v == nullptr) v = std::getenv(name);
     return v == nullptr || std::atoi(v) != 0;
 }
@@ -1707,7 +1711,7 @@ void mv_launch(int f, const BfJobs& J, int nj, int max_n, bool vec, cudaStream_t
         // 16-block chunks when that still gives 128+ CTAs, else 16 a CTA in 32-block chunks - the microbench's best
         // (MAYA_DS4_Q8MV_TC, read as STRATA_DS4_Q8MV_TC, else DS4_Q8MV_TC / MM3_Q8MV_TC; compute capability 8.0+, CUDA - q8_tc_dev)
         static const int tc = [] {
-            const char* v = std::getenv("STRATA_DS4_Q8MV_TC");
+            const char* v = std::getenv("MAYA_DS4_Q8MV_TC");
             if (v == nullptr) v = std::getenv("DS4_Q8MV_TC");
             if (v == nullptr) v = std::getenv("STRATA_MM3_Q8MV_TC");
             if (v == nullptr) v = std::getenv("MM3_Q8MV_TC");
@@ -1937,6 +1941,7 @@ MxArgs mx_args(const x3::ExpertLayout& lay, int n_embd, int n_ff, float limit) {
     m.n_embd = n_embd;
     m.n_ff = n_ff;
     m.limit = limit;
+    m.pexp = lane_parity_on() ? 1 : 0;
     return m;
 }
 }  // namespace
