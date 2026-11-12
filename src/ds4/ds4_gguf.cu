@@ -1713,13 +1713,29 @@ void mv_launch(int f, const BfJobs& J, int nj, int max_n, bool vec, cudaStream_t
             if (v == nullptr) v = std::getenv("MM3_Q8MV_TC");
             return v != nullptr ? std::atoi(v) : 0;
         }();
+        static const int tc_stg = [] {
+            const char* v = std::getenv("MAYA_DS4_TC_STAGES");
+            if (v == nullptr) v = std::getenv("DS4_Q8MV_TC_STAGES");
+            if (v == nullptr) v = std::getenv("STRATA_MM3_Q8MV_TC_STAGES");
+            if (v == nullptr) v = std::getenv("MM3_Q8MV_TC_STAGES");
+            return v != nullptr ? std::atoi(v) : 3;
+        }();
         if (vec && tc > 0 && (NC >= 4 || (tc >= 2 && NC == 2)) && q8_tc_ok(J, nj) && q8_tc_dev()) {
-            if ((max_n + 31) / 32 * nj >= 128)
-                pdl_launch(q8_mv_tc_kernel<NC, 2, 2, 16>, dim3((unsigned) ((max_n + 31) / 32), (unsigned) nj), 256,
-                           (size_t) q8_tc_smem<2, 2, 16>(), s, J);
-            else
-                pdl_launch(q8_mv_tc_kernel<NC, 1, 2, 32>, dim3((unsigned) ((max_n + 15) / 16), (unsigned) nj), 256,
-                           (size_t) q8_tc_smem<1, 2, 32>(), s, J);
+            if (tc_stg == 3) {
+                if ((max_n + 31) / 32 * nj >= 128)
+                    pdl_launch(q8_mv_tc_kernel<NC, 2, 3, 16>, dim3((unsigned) ((max_n + 31) / 32), (unsigned) nj), 256,
+                               (size_t) q8_tc_smem<2, 3, 16>(), s, J);
+                else
+                    pdl_launch(q8_mv_tc_kernel<NC, 1, 3, 32>, dim3((unsigned) ((max_n + 15) / 16), (unsigned) nj), 256,
+                               (size_t) q8_tc_smem<1, 3, 32>(), s, J);
+            } else {
+                if ((max_n + 31) / 32 * nj >= 128)
+                    pdl_launch(q8_mv_tc_kernel<NC, 2, 2, 16>, dim3((unsigned) ((max_n + 31) / 32), (unsigned) nj), 256,
+                               (size_t) q8_tc_smem<2, 2, 16>(), s, J);
+                else
+                    pdl_launch(q8_mv_tc_kernel<NC, 1, 2, 32>, dim3((unsigned) ((max_n + 15) / 16), (unsigned) nj), 256,
+                               (size_t) q8_tc_smem<1, 2, 32>(), s, J);
+            }
         } else if (vec) pdl_launch(q8_mv_kernel<NC, true>, grid, kThreads, 0, s, J);
         else pdl_launch(q8_mv_kernel<NC, false>, grid, kThreads, 0, s, J);
     } else {
