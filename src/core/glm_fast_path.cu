@@ -437,7 +437,9 @@ static int cpu_node_now() {
 #endif
 }
 
-static void* numa_pinned(size_t bytes, const RowLayout* rl = nullptr) {
+int glmfast::prefill_row_node() { return cpu_node_now(); }
+
+static void* numa_pinned(size_t bytes, const RowLayout* rl, glmfast::RowHalvesPlacement& placement) {
 #ifdef __linux__
     const char* v = getenv("MAYA_GLM_NUMA");
     const auto nodes = numa_nodes();
@@ -480,6 +482,7 @@ static void* numa_pinned(size_t bytes, const RowLayout* rl = nullptr) {
                     munmap(p, bytes);
                     return nullptr;
                 }
+                placement = {rl->gu, rl->doff, rl->blob, n0, n1};
                 const int i = g_rh_n.load();
                 if (i < 32) {
                     g_rh[i] = {(const uint8_t*) p, (const uint8_t*) p + bytes, *rl, n0, n1};
@@ -539,6 +542,8 @@ static void* numa_pinned(size_t bytes, const RowLayout* rl = nullptr) {
     return p;
 #else
     (void) bytes;
+    (void) rl;
+    (void) placement;
     return nullptr;
 #endif
 }
@@ -2025,7 +2030,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                         rl = {R.stride, F->L[(size_t) il2].gu_bytes, F->L[(size_t) il2].down_off, F->L[(size_t) il2].blob};
                         break;
                     }
-                if ((p = numa_pinned((size_t) n * R.stride, rl.gu > 0 ? &rl : nullptr)) != nullptr) {   // (over every socket: numa_pinned)
+                if ((p = numa_pinned((size_t) n * R.stride, rl.gu > 0 ? &rl : nullptr, R.row_halves)) != nullptr) {
                     R.registered = true;
                     R.per_part = 0;   // (one mapping)
                     break;
@@ -3380,7 +3385,8 @@ static std::shared_ptr<glmfast::Workers> shared_cpu_pool(int threads) {
     std::lock_guard<std::mutex> lk(mu);
     std::shared_ptr<glmfast::Workers> p = held.lock();
     if (p == nullptr || p->size() != threads) {
-        const std::vector<int> cpus = cpu_list_env("MAYA_GLM_POOL_CPUS");
+        std::vector<int> cpus = cpu_list_env("MAYA_GLM_POOL_CPUS");
+        if (cpus.empty()) cpus = cpu_list_env("GLM_POOL_CPUS");
         p = std::make_shared<glmfast::Workers>(threads - 1, 20000, cpus, concurrent, !cpus.empty());
         held = p;
     }
