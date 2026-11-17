@@ -723,6 +723,17 @@ struct Glm5Model::FastState {
     // entries; admit_evict counts them
     std::vector<int> admit_cleared;
     uint64_t admit_evict = 0;
+    // MAYA_GLM_TIER_VERIFY=1 (debug, off by default; fast_boundary): after every boundary the device's own tables are
+    // read back and checked against the host's - a RAM entry that points at a slot which no longer holds the expert
+    // ("stale": the next expert written there would be computed under this one's name), an expert resident in two
+    // VRAM slots, a VRAM entry whose slot holds another expert - and the routes count how often a stale entry was read
+    std::vector<unsigned long long> tv_tab;   // the device's table as read back (empty: the check is off)
+    std::vector<int> tv_stale;                // key -> the RAM slot its stale entry points at (the class's n: outside), -1
+    std::vector<uint8_t> tv_flag, tv_taint;   // key -> 1 in two VRAM slots | 2 entry and host disagree | 4 VRAM entry off;
+                                              // key -> a stale entry's bytes were promoted into VRAM under its name
+    std::vector<std::map<unsigned long long, int>> tv_rmap;   // per RAM class: slot pointer -> slot
+    uint64_t tv_n = 0, tv_stale_new = 0, tv_dup_new = 0, tv_split_new = 0, tv_vbad_new = 0, tv_lines = 0;
+    std::atomic<uint64_t> tv_use_same{0}, tv_use_wrong{0}, tv_promo_wrong{0}, tv_taint_use{0};
     size_t ram_bytes = 0;
     size_t all_bytes = 0;   // the bytes of every routed expert of this part's layers (the Monitor's tiers)
     // ---- demotions VRAM -> RAM (copy stream, D2H) of the victims that make room for spares
