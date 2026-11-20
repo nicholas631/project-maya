@@ -12,6 +12,7 @@
 // and after the last layer logits = head(rmsnorm(sum_s pre[s] h[s])).
 #include "ds4_model.hpp"
 #include "ds4_borrow.hpp"
+#include "ds4_cache_swap.hpp"
 #include "ds4_cpu_exl3.hpp"
 #include "ds4_ablate.hpp"
 #include "../core/ablate_capture.hpp"   // (MAYA_ABLATE_CAPTURE: the direction fitting's read-out)
@@ -260,8 +261,8 @@ std::vector<std::vector<os::Core>> node_threads() {
     }
     return nodes;
 }
-// anonymous memory on one NUMA node (node < 0: wherever the first touch puts it), transparent huge pages
-void* node_map(size_t bytes, int node, int n_nodes) { return os::anon_alloc(bytes, node, n_nodes); }
+// anonymous memory on one NUMA node (node < 0: wherever the first touch puts it), transparent huge pages when `thp` asks
+void* node_map(size_t bytes, int node, int n_nodes, bool thp = true) { return os::anon_alloc(bytes, node, n_nodes, thp); }
 void pin_self(int cpu) { os::pin_self(cpu); }
 // ZFS's reclaimable ARC is omitted from Linux MemAvailable (as in Maya's GLM path).
 // Count only bytes above its floor; the cgroup limits below still cap the result.
@@ -632,6 +633,10 @@ struct Dev {
     TopkScratch tks;                                   // a window's indexer top k over long rows (topk's segments)
     unsigned long long* plan_ptr = nullptr;           // the decode path's VRAM experts (0: on the CPU lane)
     int* cpu_any = nullptr;                           // the window's routing has a CPU-lane pick (route_publish's)
+    // the expert profile's routes of the host-free layers this device leads ([nl + n_mtp][n_exp], route_publish's
+    // count): such a layer's picks never reach the host, where the profile is counted (issue #501: the DSpark blocks,
+    // every expert of theirs in VRAM, were never counted); added to the profile when it is saved
+    unsigned* rcnt = nullptr;
     uint8_t* eg_rows = nullptr;
     uint16_t *emb_rows = nullptr, *ext = nullptr;   // the window's embedding rows; the window attention's rows
     AttnScratch attn_scr;   // a few queries' selected compressed rows decoded (sparse_attn)
@@ -1444,6 +1449,10 @@ struct Model::Impl {
     // input's rows rounded there for its GEMVs (PreQ8::rows); and the FFN's split rounds its input too, for the shared
     // expert's w1 / w3 - checked at load on 1 and kWin rows (hc_fuse_check's T, ffn_q8)
     bool hc_fuse_win = false;
+    // (DS4_HC_FUSE) whether the fused split rounds x to int8 for the GEMVs after it: a GGUF's, whose q8 GEMVs take the
+    // rows (PreQ8).  An EXL3 pack's GEMVs take x as F32, so there the fused launch writes x alone: the split, the norm
+    // and the pre copy in one launch instead of three, the same bits (hc_fuse_check compares them, without the GEMVs)
+    bool hc_q8 = true;
     // DS4_ROUTE_FUSE=1: a decoded token's (T 1) router stage on a group's lead with a next layer to guess
     // (route_fusable) - its gate and the next layer's in one launch (gemv_f32_pair), the routing and the guesses in
     // another (route_pair), publish as before - checked at load (route_fuse_check).  The load refuses it with
@@ -1827,6 +1836,7 @@ struct Model::Impl {
     struct Swap {
         int layer = 0, in = -1, out = -1;
         int ram = -1;   // (copy_mode, `in` held in RAM) the spare slot `out` is copied into from VRAM
+        bool ready = true;   // failed GGUF copies are retired without publishing the spare
         unsigned win = 0;   // (win_now at the tick that queued it)
     };
     static constexpr int kMaxSwaps = 8;
@@ -2183,6 +2193,11 @@ struct Model::Impl {
     // CPU lane (helper_dead) and the layer devices go on
     bool broken() {
         if (lend_broken || front_dead) return true;
+#if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
+        // A timed-out peer collective can leave valid GPU streams but invalid model state.
+        // Its error stays set for this process, so reset cannot make a later request safe.
+        if (peer_ar_failed.load(std::memory_order_relaxed)) return true;
+#endif
         int cur = -1;
         const bool had = cudaGetDevice(&cur) == cudaSuccess;
         bool bad = false;
@@ -3759,17 +3774,20 @@ struct Model::Impl {
                 return false;
             }
 #endif
-            if (hc_fuse && (!pk.gguf || g.hc != 4 || g.dim % 32 != 0 || g.dim > 8 * 1024 || g.sinkhorn < 1)) {
+            if (hc_fuse && (g.hc != 4 || g.dim % 32 != 0 || g.dim > 8 * 1024 || g.sinkhorn < 1)) {
                 err = std::string("DS4_HC_FUSE=") + v +
-                      ": not this model's shapes (a GGUF, 4 streams, dim a multiple of 32 up to 8192)";
+                      ": not this model's shapes (4 streams, dim a multiple of 32 up to 8192)";
                 return false;
             }
+            hc_q8 = pk.gguf;   // (an EXL3 pack: x alone, its GEMVs take it as F32)
             if (hc_fuse)
-                std::fprintf(stderr, "ds4: a decoded token's HC split and norm in one launch, its attention input "
-                                     "rounded to int8 there, the layer's pre copy by its FFN split (DS4_HC_FUSE)%s\n",
-                             hc_fuse_win ? "; a decode window's rows too, the FFN input rounded for the shared expert "
-                                           "(DS4_HC_FUSE=2)"
-                                         : "");
+                std::fprintf(stderr, "ds4: a decoded token's HC split and norm in one launch%s, the layer's pre "
+                                     "copy by its FFN split (DS4_HC_FUSE)%s\n",
+                             hc_q8 ? ", its attention input rounded to int8 there" : "",
+                             !hc_fuse_win ? ""
+                             : hc_q8      ? "; a decode window's rows too, the FFN input rounded for the shared expert "
+                                            "(DS4_HC_FUSE=2)"
+                                          : "; a decode window's rows too (DS4_HC_FUSE=2)");
         }
         if (const char* v = ds4_env("DS4_HC_MIX_SPLIT")) {   // (MAYA_DS4_HC_MIX_SPLIT)
             if (std::strcmp(v, "1") != 0 && std::strcmp(v, "2") != 0 && std::strcmp(v, "0") != 0) {
@@ -4431,7 +4449,8 @@ struct Model::Impl {
                       dalloc(d, d.tok, 16, err) && dalloc(d, d.emb_rows, W * D, err) &&
                       dalloc(d, d.ext, ((size_t) g.win + W) * g.hd, err) && dalloc(d, d.xe, P * D, err) &&
                       dalloc(d, d.xg, P * g.ff, err) && dalloc(d, d.xu, P * g.ff, err) && dalloc(d, d.xhh, P * g.ff, err) &&
-                      dalloc(d, d.ed, P * D, err) && dalloc(d, d.plan_ptr, P, err) && dalloc(d, d.cpu_any, 1, err);
+                      dalloc(d, d.ed, P * D, err) && dalloc(d, d.plan_ptr, P, err) && dalloc(d, d.cpu_any, 1, err) &&
+                      dalloc(d, d.rcnt, (size_t) (g.nl + g.n_mtp) * g.n_exp, err);
             if (!ok) return false;
             CK(cudaMemset(d.cpu_any, 0, sizeof(int)));
             d.attn_scr.max_t = kAttnScratchT;
@@ -4446,8 +4465,9 @@ struct Model::Impl {
                 return false;
             if ((decode_trim & 8) && g.n_mtp > 0 && !(hmap(d.dhand, dhand_bytes(), err) && hmap(d.dhand_flag, 8, err)))
                 return false;   // (hmap zeroes them: the flag starts below every sequence)
-            if (hc_fuse && !(dalloc(d, d.xq8, (size_t) (hc_fuse_win ? kWin : 1) * D, err) &&   // (=2: a window's rows)
-                             dalloc(d, d.xd8, (size_t) (hc_fuse_win ? kWin : 1) * D / 32, err)))
+            if (hc_fuse && hc_q8 &&   // (=2: a window's rows)
+                !(dalloc(d, d.xq8, (size_t) (hc_fuse_win ? kWin : 1) * D, err) &&
+                  dalloc(d, d.xd8, (size_t) (hc_fuse_win ? kWin : 1) * D / 32, err)))
                 return false;
             if (!g.eg_layers.empty()) {
                 const int cols = (pk.eg_ngram - 1) * pk.eg_heads;
@@ -5202,9 +5222,9 @@ struct Model::Impl {
     // model is loaded, on a thread of its own (a thread a GPU), while the first person still types: the pass's kinds
     // of product (the mHC mix in F32, the FP16 projections, the indexer's FP16 weights) on zeros in the prompt
     // buffers of a fixed size (never a borrowed tail), on the device's stream - they stay zeros, nothing else is
-    // touched, so the answers are what they were.  A prompt that comes first waits for it (blas_wait: never longer
-    // than its own first products would have taken), and so does a picture (its room may be those buffers); one that
-    // comes before it started stops it
+    // touched, so the answers are what they were.  A request that comes first waits for it (blas_wait, at its
+    // begin_request: never longer than a prompt's own first products would have taken), and so does a picture (its
+    // room may be those buffers); one that comes before it started stops it
     std::thread blas_th;
     std::mutex blas_mu;
     std::atomic<bool> blas_skip{false};
@@ -9071,6 +9091,11 @@ struct Model::Impl {
             used += add;
             ++n_copy[(size_t) l.il];
         }
+        // transparent huge pages for the arena only with MAYA_DS4_ARENA_THP=1: with the page cache full, each fault
+        // in a huge-page arena compacts memory while the copy fills the cache, which slows the copy several times
+        const bool arena_thp = tri_of(ds4_env("DS4_ARENA_THP")) == 1;
+        std::fprintf(stderr, "ds4: copy arena: transparent huge pages %s\n",
+                     arena_thp ? "requested (MAYA_DS4_ARENA_THP=1)" : "not requested (MAYA_DS4_ARENA_THP=1 requests them)");
         // each layer's slots: one block per node of (copies + spare) parts
         bool huge_short = false;   // (the pool ran out: said once)
         double huge_got = 0;       // (the bytes on huge pages)
@@ -9092,7 +9117,7 @@ struct Model::Impl {
                                          "vm.nr_hugepages=N) - the rest in the ordinary arena\n");
                     huge_short = true;
                 }
-                if (base[(size_t) X] == nullptr) base[(size_t) X] = (uint8_t*) node_map(bytes, X, NH);
+                if (base[(size_t) X] == nullptr) base[(size_t) X] = (uint8_t*) node_map(bytes, X, NH, arena_thp);
                 else huge_got += (double) got;
                 ok = base[(size_t) X] != nullptr;
                 if (ok) {
@@ -9514,10 +9539,52 @@ struct Model::Impl {
     // tp 8 (orcarouter's Mix-256G), the 72 readers ~33 GB/s together, the prompt's limit (nsys: each member's thread
     // staging ~20 of 38 s).  All or none (DS4_COPY_PIN=0: none - the staging, as before); zc_pin's chunks count
     bool cp_dma = false;
+#if defined(_WIN32) && !defined(STRATA_USE_HIP)
+    // #794 (Windows, NVIDIA): every GPU's free VRAM in MiB now (-1: the driver's read failed), the current device kept
+    std::vector<long long> free_mib_all() const {
+        int cur = 0;
+        if (cudaGetDevice(&cur) != cudaSuccess) (void) cudaGetLastError();
+        std::vector<long long> v;
+        for (const Dev& d : devs) {
+            size_t fr = 0, tot = 0;
+            long long m = -1;
+            if (cudaSetDevice(d.id) == cudaSuccess && mem_info(&fr, &tot) == cudaSuccess)
+                m = (long long) (fr >> 20);
+            else
+                (void) cudaGetLastError();
+            v.push_back(m);
+        }
+        cudaSetDevice(cur);
+        return v;
+    }
+    // the log's numbers: "CUDA0 1412 -> 0, CUDA1 ..." (MiB free before -> after the pin; ? a failed read)
+    std::string free_pair_text(const std::vector<long long>& pre, const std::vector<long long>& post) const {
+        std::string s;
+        for (size_t i = 0; i < devs.size() && i < pre.size() && i < post.size(); ++i) {
+            if (!s.empty()) s += ", ";
+            s += "CUDA" + std::to_string(devs[i].id) + " " + (pre[i] < 0 ? std::string("?") : std::to_string(pre[i])) +
+                 " -> " + (post[i] < 0 ? std::string("?") : std::to_string(post[i]));
+        }
+        return s;
+    }
+    // the GPU whose room the pin took (pin_took_vram; -1: none).  MAYA_DS4_PIN_VRAM_FLOOR_MIB: the floor (256; 0: off)
+    int pin_hurt_dev(const std::vector<long long>& pre, const std::vector<long long>& post) const {
+        static const long long floor_mib = [] {
+            const char* v = ds4_env("DS4_PIN_VRAM_FLOOR_MIB");
+            return v != nullptr && v[0] != '\0' ? std::atoll(v) : 256LL;
+        }();
+        for (size_t i = 0; i < pre.size() && i < post.size(); ++i)
+            if (pin_took_vram(pre[i], post[i], floor_mib)) return (int) i;
+        return -1;
+    }
+#endif
     void cp_pin() {
         if (!copy_mode || chunk <= 0 || ram_chunks.empty()) return;
         if (const char* v = std::getenv("DS4_COPY_PIN"); v != nullptr && std::atoi(v) == 0) return;
         const double t0 = now_ms();
+#if defined(_WIN32) && !defined(STRATA_USE_HIP)
+        const std::vector<long long> pre = free_mib_all();   // (#794: what the pin does to every GPU's free VRAM)
+#endif
         const size_t nc = ram_chunks.size();
         zc_chunk.resize(nc, 0);
         std::vector<char> mine(nc, 0);   // (1: this call pinned it, 2: it failed)
@@ -9542,6 +9609,17 @@ struct Model::Impl {
             for (size_t c = 0; c < nc; ++c)
                 if (mine[c] == 1) cudaHostUnregister(ram_chunks[c]);
             std::fprintf(stderr, "ds4: pinning the copied experts (%.1f GB) failed - the prompt path stages them as before\n", gb);
+#if defined(_WIN32) && !defined(STRATA_USE_HIP)
+            {   // (#794: a failed pin, given back, that still left a GPU near empty - said with the numbers)
+                const std::vector<long long> post = free_mib_all();
+                const int h = pin_hurt_dev(pre, post);
+                std::fprintf(stderr, "ds4: free VRAM (MiB) before -> after the failed pin: %s%s\n",
+                             free_pair_text(pre, post).c_str(),
+                             h < 0 ? ""
+                                   : " - WARNING: a GPU is left near empty and requests can fail with out of memory; "
+                                     "set DS4_COPY_PIN=0 in the config's \"env\" (#794)");
+            }
+#endif
             return;
         }
         // (pinned last: the room the engine's later pinned buffers need must still be there - else these pins go back)
@@ -9554,6 +9632,28 @@ struct Model::Impl {
                          gb, pin_room_gb());
             return;
         }
+#if defined(_WIN32) && !defined(STRATA_USE_HIP)
+        // #794: on Windows with several NVIDIA GPUs the pin left every GPU at "0 MiB free" and the first request failed
+        // with out of memory (DS4_COPY_PIN=0 ran).  A pin that leaves a GPU near empty goes back - the staging, as
+        // when the pin fails - and the log has the numbers either way
+        {
+            const std::vector<long long> post = free_mib_all();
+            const int h = pin_hurt_dev(pre, post);
+            std::fprintf(stderr, "ds4: free VRAM (MiB) before -> after pinning the copied experts: %s\n",
+                         free_pair_text(pre, post).c_str());
+            if (h >= 0) {
+                for (size_t c = 0; c < nc; ++c)
+                    if (mine[c] == 1) cudaHostUnregister(ram_chunks[c]);
+                cudaGetLastError();
+                const std::vector<long long> back = free_mib_all();
+                std::fprintf(stderr, "ds4: pinning the copied experts (%.1f GB) left CUDA%d near empty - given back, the "
+                                     "prompt path stages them as before (DS4_COPY_PIN=0 skips the pin; "
+                                     "MAYA_DS4_PIN_VRAM_FLOOR_MIB=0 keeps it); free VRAM (MiB) after giving it back: %s\n",
+                             gb, devs[(size_t) h].id, free_pair_text(pre, back).c_str());
+                return;
+            }
+        }
+#endif
         for (size_t c = 0; c < nc; ++c)
             if (mine[c] == 1) zc_chunk[c] = 1;
         cp_dma = true;
@@ -9819,7 +9919,14 @@ struct Model::Impl {
                     }
             size_t fr = 0, tot = 0;
             cudaSetDevice(d.id);
-            mem_info(&fr, &tot);
+            // (#794: a failed read printed "0 MiB free" - the driver's reason instead; a good read prints as before)
+            const cudaError_t fe = mem_info(&fr, &tot);
+            if (fe != cudaSuccess) (void) cudaGetLastError();
+            char frs[96];
+            if (fe == cudaSuccess)
+                std::snprintf(frs, sizeof frs, "%.0f MiB free", fr / 1048576.0);
+            else
+                std::snprintf(frs, sizeof frs, "free VRAM unknown (%s)", cudaGetErrorString(fe));
             const size_t gsz = groups.empty() ? 1 : groups[(size_t) d.grp].mem.size();
             char tp[64] = "";
             if (gsz > 1) std::snprintf(tp, sizeof tp, " (tensor parallel %zu, part %d)", gsz, d.mi);
@@ -9834,9 +9941,9 @@ struct Model::Impl {
             char line[384];
             std::snprintf(line, sizeof line,
                           "ds4: CUDA%d layers [%d, %d]%s%s%s: weights %.2f GB, experts %.2f GB (%d of %d in VRAM), caches "
-                          "%.2f GB, %.0f MiB free\n",
+                          "%.2f GB, %s\n",
                           d.id, a, b, tp, (int) di == head_dev ? " + head" : "", dr, d.weights / 1e9, d.experts / 1e9, ev, et,
-                          d.caches / 1e9, fr / 1048576.0);
+                          d.caches / 1e9, frs);
             s << line;
         }
         int nh = 0;
@@ -12147,7 +12254,7 @@ struct Model::Impl {
             }
             Layer& l = L[(size_t) sw.layer];
             if (l.lay.fmt == gg::kFmtMXFP4) {   // in: from the file; out: nothing to keep (the file has it)
-                swap_in_mx(l, sw, B);
+                sw.ready = swap_in_mx(l, sw, B);
                 std::lock_guard<std::mutex> lk(sw_mu);
                 sw_ready.push_back(sw);
                 continue;
@@ -12644,29 +12751,31 @@ struct Model::Impl {
         store->unpin(s);
         return true;
     }
-    void swap_in_mx(Layer& l, Swap& sw, SwapBufs& B) {
+    bool swap_in_mx(Layer& l, Swap& sw, SwapBufs& B) {
         uint8_t *sw_a = B.a, *sw_b = B.b, *sw_h = B.h;   // (this thread's)
         const std::vector<cudaStream_t>& copy_st = B.st;
         // (a copy holds its slot till this swap's switch; an in-place one the RAM store holds: from its slot)
-        bool ok = copy_mode && !l.ram.empty() && l.ram[(size_t) sw.in] >= 0
-                      ? read_mx(l, sw.in, sw_a)
-                      : store_blob(l, sw.in, sw_a) || read_mx_file(l, sw.in, sw_a);
-        for (int m = 0; m < l.nm && ok; ++m) {
+        const bool prepared = prepare_cache_swap(l.nm, [&] {
+            return copy_mode && !l.ram.empty() && l.ram[(size_t) sw.in] >= 0
+                       ? read_mx(l, sw.in, sw_a)
+                       : store_blob(l, sw.in, sw_a) || read_mx_file(l, sw.in, sw_a);
+        }, [&](int m) {
             const Layer& x = member(l, m);
-            cudaSetDevice(devs[(size_t) x.dev].id);
+            if (cudaSetDevice(devs[(size_t) x.dev].id) != cudaSuccess) return false;
             cudaStream_t cs = copy_st[(size_t) x.dev];
             if (l.nm > 1) blob_to_half(l, sw_a, m, sw_h);
-            ok = cudaMemcpyAsync(sat(l, x, l.spare_vram, unit(x)), l.nm > 1 ? sw_h : sw_a, unit(x),
-                                 cudaMemcpyHostToDevice, cs) == cudaSuccess &&
-                 cudaStreamSynchronize(cs) == cudaSuccess;
-        }
+            return cudaMemcpyAsync(sat(l, x, l.spare_vram, unit(x)), l.nm > 1 ? sw_h : sw_a, unit(x),
+                                   cudaMemcpyHostToDevice, cs) == cudaSuccess &&
+                   cudaStreamSynchronize(cs) == cudaSuccess;
+        });
+        bool ok = prepared;
         if (sw.ram >= 0) {   // `out` from its VRAM slot (each member its part) into the spare RAM slot
             bool got = ok;
             for (int m = 0; m < l.nm && got; ++m) {
                 const Layer& x = member(l, m);
-                cudaSetDevice(devs[(size_t) x.dev].id);
+                got = cudaSetDevice(devs[(size_t) x.dev].id) == cudaSuccess;
                 cudaStream_t cs = copy_st[(size_t) x.dev];
-                got = cudaMemcpyAsync(l.nm > 1 ? sw_h : sw_b, sat(l, x, l.slot[(size_t) sw.out], unit(x)),
+                got = got && cudaMemcpyAsync(l.nm > 1 ? sw_h : sw_b, sat(l, x, l.slot[(size_t) sw.out], unit(x)),
                                       unit(x), cudaMemcpyDeviceToHost, cs) == cudaSuccess &&
                       cudaStreamSynchronize(cs) == cudaSuccess;
                 if (got && l.nm > 1) half_to_blob(l, sw_h, m, sw_b);
@@ -12680,9 +12789,9 @@ struct Model::Impl {
             bool got = true;
             for (int m = 0; m < l.nm && got; ++m) {
                 const Layer& x = member(l, m);
-                cudaSetDevice(devs[(size_t) x.dev].id);
+                got = cudaSetDevice(devs[(size_t) x.dev].id) == cudaSuccess;
                 cudaStream_t cs = copy_st[(size_t) x.dev];
-                got = cudaMemcpyAsync(l.nm > 1 ? sw_h : sw_b, sat(l, x, l.slot[(size_t) sw.out], unit(x)), unit(x),
+                got = got && cudaMemcpyAsync(l.nm > 1 ? sw_h : sw_b, sat(l, x, l.slot[(size_t) sw.out], unit(x)), unit(x),
                                       cudaMemcpyDeviceToHost, cs) == cudaSuccess &&
                       cudaStreamSynchronize(cs) == cudaSuccess;
                 if (got && l.nm > 1) half_to_blob(l, sw_h, m, sw_b);
@@ -12695,10 +12804,10 @@ struct Model::Impl {
             std::vector<uint8_t> dev(l.blob), h(l.blob), file(l.blob);   // (h: the widest member's part fits)
             for (int m = 0; m < l.nm && ok; ++m) {
                 const Layer& x = member(l, m);
-                cudaSetDevice(devs[(size_t) x.dev].id);
-                cudaMemcpy(l.nm > 1 ? h.data() : dev.data(), sat(l, x, l.spare_vram, unit(x)), unit(x),
-                           cudaMemcpyDeviceToHost);
-                if (l.nm > 1) half_to_blob(l, h.data(), m, dev.data());
+                ok = cudaSetDevice(devs[(size_t) x.dev].id) == cudaSuccess;
+                if (ok) ok = cudaMemcpy(l.nm > 1 ? h.data() : dev.data(), sat(l, x, l.spare_vram, unit(x)), unit(x),
+                                        cudaMemcpyDeviceToHost) == cudaSuccess;
+                if (ok && l.nm > 1) half_to_blob(l, h.data(), m, dev.data());
             }
             ok = ok && read_mx_file(l, sw.in, file.data());
             for (int r = 0; r < 3 && ok; ++r)
@@ -12712,9 +12821,11 @@ struct Model::Impl {
             }
             std::fprintf(stderr, "ds4 cache: layer %d expert %d in, %d out%s: %s\n", l.il, sw.in, sw.out,
                          sw.ram >= 0 ? " (into RAM)" : "", ok && ok_out ? "matches the model file" : "MISMATCH");
+            ok = ok && ok_out;
         } else if (!ok) {
             std::fprintf(stderr, "ds4 cache: layer %d expert %d: the move into VRAM failed\n", l.il, sw.in);
         }
+        return ok;
     }
 
     // a tick's table entries start empty, and go to the devices in tick_flush (the recent slots' and the swaps')
@@ -12840,6 +12951,11 @@ struct Model::Impl {
         }
         for (const Swap& sw : ready) {
             Layer& l = L[(size_t) sw.layer];
+            if (discard_failed_cache_swap(sw.ready, l.swap_pending, l.sw_in, sw_inflight)) {
+                std::fprintf(stderr, "ds4 cache: layer %d expert %d: failed move discarded; active experts unchanged\n",
+                             l.il, sw.in);
+                continue;
+            }
             const int old_slot = l.slot[(size_t) sw.out];
             const std::array<uint8_t*, 4> old_parts = l.hh[(size_t) sw.in];
             if (copy_mode) {   // (`out` takes the RAM place `in` leaves: through the spare, which `in`'s slot becomes)
@@ -13645,7 +13761,8 @@ struct Model::Impl {
                 for (int kind = 0; kind < 3 && bad.empty(); ++kind)
                     for (int ffn = 0; ffn < 2 && bad.empty(); ++ffn) {
                         const Layer& l = *lp;
-                        const bool q8 = !ffn || ffn_q8;   // (x's int8 rows: the attention's; the FFN's with ffn_q8)
+                        const bool q8 = hc_q8 && (!ffn || ffn_q8);   // (x's int8 rows: the attention's; the FFN's with
+                                                                     //  ffn_q8; none for an EXL3 pack)
                         float *hh = hin.data(), *hm = hh + (size_t) T * 4 * D, *hl = hm + 32 * T, *hw = hl + 8 * T;
                         for (int t = 0; t < T; ++t)
                             for (int e = 0; e < D; ++e) {
@@ -13791,20 +13908,23 @@ struct Model::Impl {
             cudaEventDestroy(ev);
             if (!bad.empty()) return fail_at(bad);
             std::string kinds;
-            for (int k = 2; k <= 4; ++k) {
+            for (int k = 2; k <= 4 && hc_q8; ++k) {   // (an EXL3 pack: no rounding, its GEMVs take x itself)
                 if (kind_held[k] && !kind_run[k])
                     return fail_at("the attention's " + std::to_string(k) + "-GEMV input not checked");
                 if (kind_run[k]) kinds += (kinds.empty() ? "" : ", ") + std::to_string(k);
             }
             std::string ids;
             for (const Layer* lp : ls) ids += (ids.empty() ? "" : " ") + std::to_string(lp->il);
+            const std::string what = hc_q8 ? "attention inputs of " + kinds + " GEMVs; " : "";
             std::fprintf(stderr,
-                         "ds4: CUDA%d HC fuse check%s: %d runs (layers %s; attention inputs of %s GEMVs; attention and "
-                         "FFN; random / edges / ties): pre, post, comb, the pre copy, x, its int8 rounding and the "
-                         "attention GEMVs%s the old kernels' bit for bit, all finite, every guard intact "
-                         "(DS4_HC_FUSE%s)\n",
-                         d.id, rows.c_str(), runs, ids.c_str(), kinds.c_str(),
-                         ffn_q8 ? ", the FFN's int8 rounding and the shared expert's w1 / w3 GEMVs" : "",
+                         "ds4: CUDA%d HC fuse check%s: %d runs (layers %s; %sattention and FFN; random / edges / "
+                         "ties): pre, post, comb, the pre copy, x%s the old kernels' bit for bit, all finite, every "
+                         "guard intact (DS4_HC_FUSE%s)\n",
+                         d.id, rows.c_str(), runs, ids.c_str(), what.c_str(),
+                         !hc_q8   ? " (x as F32: an EXL3 pack's GEMVs take it so)"
+                         : ffn_q8 ? ", its int8 rounding and the attention GEMVs, the FFN's int8 rounding and the "
+                                    "shared expert's w1 / w3 GEMVs"
+                                  : ", its int8 rounding and the attention GEMVs",
                          ffn_q8 ? "=2" : "");
         }
         return true;
@@ -15884,6 +16004,11 @@ struct Model::Impl {
             const char* v = ds4_env("DS4_SERVICE_DEEP_MS");
             return v ? std::max(1, std::atoi(v)) : 100;
         }();
+        // the two sleeps' lengths (issue #951): MAYA_DS4_SERVICE_NAP_US (100) and MAYA_DS4_SERVICE_SLEEP_MS (2)
+        static const int kNapUs = strata::platform::idle_sleep_setting(
+            ds4_env("DS4_SERVICE_NAP_US"), 100, strata::platform::kIdleNapUsMin, strata::platform::kIdleNapUsMax);
+        static const int kSleepMs = strata::platform::idle_sleep_setting(
+            ds4_env("DS4_SERVICE_SLEEP_MS"), 2, strata::platform::kIdleSleepMsMin, strata::platform::kIdleSleepMsMax);
         strata::platform::IdleGate& gate = strata::platform::idle_gate();
         uint64_t gate_seen = 0;
         bool deep = false;
@@ -15902,9 +16027,9 @@ struct Model::Impl {
                             last = std::chrono::steady_clock::now();
                         }
                     } else if (quiet > std::chrono::milliseconds(10 * (int64_t) kIdleMs)) {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                        std::this_thread::sleep_for(std::chrono::milliseconds(kSleepMs));
                     } else {
-                        std::this_thread::sleep_for(std::chrono::microseconds(100));
+                        std::this_thread::sleep_for(std::chrono::microseconds(kNapUs));
                     }
                     continue;
                 }
@@ -16662,7 +16787,20 @@ struct Model::Impl {
     // decode's check that streaming pays (LaneAB): a window's mean time with the split against the CPU lane alone;
     // the first window only warms up; 3% slower twice in a row: off (this kind of request streams nothing from then
     // on), twice not slower - faster or a tie: it keeps streaming, as it does when still undecided after 9 windows
-    // (pcie::ab_window, #697).  The times file keeps the verdict for the next start
+    // (pcie::ab_window, #697); a layer split: a tie turns it off (ab_tie_keeps).  The times file keeps the verdict for
+    // the next start
+    // one GPU: a tie in decode's checks keeps streaming (#697: there the lane's slots also carry the one-GPU decode
+    // path, which a written-off tie took away); several GPUs: the rule before #697 - 3% faster, else off (#956: on
+    // 2x RTX A4000 and 4x RTX 3090 a start with the lane off decoded 4-5% faster where the checks measured ties: the
+    // lane's cost when little streams falls on both of a check's turns).  DS4_STREAM_TIE=keep / off: either rule on
+    // any PC (A/B tests)
+    bool ab_tie_keeps() const {
+        static const int forced = [] {
+            const char* v = std::getenv("DS4_STREAM_TIE");
+            return v == nullptr ? -1 : std::strcmp(v, "keep") == 0 ? 1 : std::strcmp(v, "off") == 0 ? 0 : -1;
+        }();
+        return forced >= 0 ? forced == 1 : devs.size() <= 1;
+    }
     void lane_ab(LaneCls& C, int kind, bool split, double ms) {
         LaneAB& A = C.ab[kind];
         if (A.verdict != 0 || !(ms >= 0.0)) return;
@@ -16672,7 +16810,7 @@ struct Model::Impl {
         const double m0 = A.ms[0] / A.n[0], m1 = A.ms[1] / A.n[1], gain = 1.0 - m1 / m0;
         A.ms[0] = A.ms[1] = 0;
         A.n[0] = A.n[1] = 0;
-        A.verdict = pcie::ab_window(A.wins, A.good, A.bad, gain);   // (a tie keeps streaming: #697)
+        A.verdict = pcie::ab_window(A.wins, A.good, A.bad, gain, ab_tie_keeps());   // (see ab_tie_keeps)
         if (A.verdict == 0) return;
         std::fprintf(stderr, "ds4: PCIe lane: CUDA%d %s: decode measured the split against the CPU lane alone on "
                              "requests with %s: %.2f against %.2f ms (%+.1f%%) -> %s\n",
@@ -16693,7 +16831,8 @@ struct Model::Impl {
     // streaming allowed, or none (decoded tokens: the lane serves T == 1 steps only) - and their time a token decides with lane_ab's rule over windows of 64 tokens of each:
     // 3% slower twice in a row: none from then on, and the times file keeps it for the next start; twice not slower
     // (faster or a tie), or undecided after 9 windows: streaming stays (lane_ab decides the rest) - a tie is not written
-    // as off (pcie::ab_window, #697).  DS4_STREAM_TOKEN_AB=0: off (A/B tests)
+    // as off (pcie::ab_window, #697) on one GPU; a layer split: 3% faster or off, as before #697 (ab_tie_keeps, #956).
+    // DS4_STREAM_TOKEN_AB=0: off (A/B tests)
     struct TokAB {
         double ms[2] = {0, 0};
         int64_t n[2] = {0, 0};
@@ -16738,7 +16877,7 @@ struct Model::Impl {
         const double m0 = A.ms[0] / (double) A.n[0], m1 = A.ms[1] / (double) A.n[1], gain = 1.0 - m1 / m0;
         A.ms[0] = A.ms[1] = 0;
         A.n[0] = A.n[1] = 0;
-        A.verdict = pcie::ab_window(A.wins, A.good, A.bad, gain);   // (the first window warms up; a tie keeps it: #697)
+        A.verdict = pcie::ab_window(A.wins, A.good, A.bad, gain, ab_tie_keeps());   // (see ab_tie_keeps)
         if (A.verdict == 0) return;
         std::fprintf(stderr, "ds4: PCIe lane: decode measured whole steps with the split against the CPU lane alone: "
                              "%.2f against %.2f ms a token (%+.1f%%) -> %s\n", m1, m0, -100.0 * gain,
@@ -18385,10 +18524,10 @@ struct Model::Impl {
                 }();
                 a[m].timeout_ticks = uint64_t(double(wall_clock_khz) * 1000.0 * peer_timeout_s);
                 ok = hipExtMallocWithFlags((void**) &a[m].recv, 2 * a[m].stride * sizeof(float),
-                                           hipDeviceMallocFinegrained) == hipSuccess &&
+                                           hipDeviceMallocUncached) == hipSuccess &&
                      hipExtMallocWithFlags((void**) &a[m].flags,
                                            2 * kPeerArBlocks * kPeerArFlagStride * sizeof(unsigned),
-                                           hipDeviceMallocFinegrained) == hipSuccess &&
+                                           hipDeviceMallocUncached) == hipSuccess &&
                      hipMalloc((void**) &a[m].error, sizeof(unsigned)) == hipSuccess &&
                      hipMalloc((void**) &a[m].failure, sizeof(PeerArFailure)) == hipSuccess;
                 if (ok) ok = hipMemset(a[m].flags, 0, 2 * kPeerArBlocks * kPeerArFlagStride * sizeof(unsigned)) == hipSuccess &&
@@ -22646,7 +22785,7 @@ struct Model::Impl {
         else
             hc_mix(d.h, l.hca_fn, H * D, (2 + H) * H, T, g.eps, d.mix, hcs);
         gg::PreQ8 xq8;
-        if (fuse) {
+        if (fuse) {   // (d.xq8 / d.xd8 null without hc_q8: x alone)
             hc_split_pre_norm(
                 hc_args(l, false, d.mix, d.h, d.pre, d.x, d.xq8, d.xd8, d.a_pre, d.a_post, d.a_comb, nullptr), s, T);
             xq8.x = d.x;
@@ -22663,7 +22802,7 @@ struct Model::Impl {
         {
             x3::MvJob j[4];
             const int nj = attn_in_jobs(l, d.x, d.qr, d.kvr, d.ckr, d.cgr, T, j);
-            if (!mv_n(d, j, nj, err, fuse ? &xq8 : nullptr)) return false;
+            if (!mv_n(d, j, nj, err, fuse && hc_q8 ? &xq8 : nullptr)) return false;
         }
         Finish fq;
         fq.w = l.q_norm;
@@ -22745,7 +22884,8 @@ struct Model::Impl {
             hc_mix(d.h, l.hcf_fn, H * D, (2 + H) * H, T, g.eps, d.mix, hcs);
         if (fuse)   // (d.pre's copy of f_pre now: nothing here reads d.pre before the layer's end)
             hc_split_pre_norm(
-                hc_args(l, true, d.mix, d.h, d.a_pre, d.x, hc_fuse_win ? d.xq8 : nullptr, hc_fuse_win ? d.xd8 : nullptr,
+                hc_args(l, true, d.mix, d.h, d.a_pre, d.x, hc_fuse_win && hc_q8 ? d.xq8 : nullptr,
+                        hc_fuse_win && hc_q8 ? d.xd8 : nullptr,
                         d.f_pre, d.f_post, d.f_comb, d.pre),
                 s, T);   // (=2: x rounded for the shared expert's w1 / w3 - xq8 now the FFN's)
         else {
@@ -22754,7 +22894,7 @@ struct Model::Impl {
             if (hs) CK(cudaEventRecord(d.hc_done, d.st2));
             hc_pre_norm(d.h, d.a_pre, l.ffn_norm, D, H, T, g.eps, d.x, s);
         }
-        const gg::PreQ8* ffn_q8 = fuse && hc_fuse_win ? &xq8 : nullptr;   // (the shared expert's w1 / w3 input)
+        const gg::PreQ8* ffn_q8 = fuse && hc_fuse_win && hc_q8 ? &xq8 : nullptr;   // (the shared expert's w1 / w3)
         if (wp.async) {
             // the routing goes to the service thread through the mailbox (a group's lead publishes it, the members
             // make the same plan) while the device runs the shared expert and the VRAM experts (from the plan the
@@ -22820,7 +22960,7 @@ struct Model::Impl {
                 route_publish(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, rh_vtab(l), d.x, D, d.ridx, d.rw,
                               d.plan_ptr, lead ? preq : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl,
                               na[0], na[1], lead && self_answer ? resps + slot : nullptr, d.cpu_any,
-                              lane_done);
+                              lane_done, mi == 0 && sq == 0 && host_free(l) ? dev_count(d, l.il) : nullptr);
             }
             if (rh_lead && lead && !rh_req_out(slot, T, s, err)) return false;
             {
@@ -23511,13 +23651,39 @@ struct Model::Impl {
             // never moved on and only .tmp files were left)
             if (!ok || !os::replace_file(tmp, path)) std::remove(tmp.c_str());
         };
+        if (o.profile_out.empty() && (o.profile.empty() || o.profile_readonly)) return;
+        // (the host's counts and the devices' - the host-free layers' routes, issue #501)
+        std::vector<uint32_t> all = prof;
+        add_dev_counts(all);
         if (!o.profile_out.empty()) {   // (--profile-out: this run's routing alone - the counts only ever grow)
-            std::vector<uint32_t> run(prof.size());
-            for (size_t i = 0; i < prof.size(); ++i) run[i] = prof[i] - (i < prof_load.size() ? prof_load[i] : 0u);
+            std::vector<uint32_t> run(all.size());
+            for (size_t i = 0; i < all.size(); ++i) run[i] = all[i] - (i < prof_load.size() ? prof_load[i] : 0u);
             write(o.profile_out, run);
         }
         if (o.profile.empty() || o.profile_readonly) return;
-        write(o.profile, prof);
+        write(o.profile, all);
+    }
+    // a host-free layer's device counts (route_publish's count): layer il's row of the device's rcnt
+    unsigned* dev_count(Dev& d, int il) const {
+        return d.rcnt != nullptr && il >= 0 && il < g.nl + g.n_mtp ? d.rcnt + (size_t) il * g.n_exp : nullptr;
+    }
+    // every device's counts since the load added to v (the profile's [nl + n_mtp][n_exp]) - at a save, between
+    // requests: each device's stream has finished the routings it counts
+    void add_dev_counts(std::vector<uint32_t>& v) const {
+        const size_t n = (size_t) (g.nl + g.n_mtp) * g.n_exp;
+        if (v.size() < n) return;
+        std::vector<uint32_t> h(n);
+        int cur = 0;
+        cudaGetDevice(&cur);
+        for (const Dev& d : devs) {
+            if (d.rcnt == nullptr) continue;
+            cudaSetDevice(d.id);
+            if (cudaMemcpyAsync(h.data(), d.rcnt, n * sizeof(unsigned), cudaMemcpyDeviceToHost, d.st) != cudaSuccess ||
+                cudaStreamSynchronize(d.st) != cudaSuccess)
+                continue;
+            for (size_t i = 0; i < n; ++i) v[i] += h[i];
+        }
+        cudaSetDevice(cur);
     }
 
     std::vector<std::string> info_lines() const {
@@ -23895,6 +24061,11 @@ int Model::fed() const { return p_->fed_n; }
 bool Model::cancelled() const { return p_->halted; }
 bool Model::broken() { return p_->broken(); }
 void Model::begin_request() {
+    // (#1006: the prompt path's GEMM warm-up finished first for every request, not only for a chunked read - its first
+    //  cuBLAS products load their kernels into the context, and a request right after the load (--bench, the speed
+    //  calibration) whose window kernels wait for each other across the GPUs hung on that load: one GPU at 100%, the
+    //  other idle, its launches behind the driver's lock the loading thread held)
+    p_->blas_wait();
     p_->begin_request();
     p_->part_pre.have = false;
     if (p_->part_link()) p_->part_mirror(part::kBegin, part::Writer());

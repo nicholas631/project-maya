@@ -75,6 +75,17 @@ inline std::pair<size_t, bool> pool_reserve(size_t device_free, size_t reserve, 
     return {device_free - floor, true};
 }
 
+// What the "no room for the expert pool" error says about a reserve set by hand (#899): a smaller one is named only
+// where it can make the room - the pool's budget measured more than 0 and what is short fits in the reserve.  A budget
+// of 0 means the free VRAM read was no more than the reserve: something else holds the VRAM, and a smaller reserve
+// only moves that figure.  A default reserve is not named (the start already lowers it where that helps).
+enum class ReserveHint { none, smaller, budget_zero, short_beyond };
+inline ReserveHint reserve_hint(bool given, size_t budget, size_t short_bytes, size_t reserve) {
+    if (!given) return ReserveHint::none;
+    if (budget == 0) return ReserveHint::budget_zero;
+    return short_bytes <= reserve ? ReserveHint::smaller : ReserveHint::short_beyond;
+}
+
 // The check of a written budget: the bytes it gives back once `have` of the `asked` bytes were allocated and touched
 // and `free_after` was read - what the driver refused, plus what the reserve is short by and 64 MiB.  A read of
 // nearly nothing free (under 16 MiB) only says "at least": the first two give back 1 GiB each, later ones a quarter.
@@ -87,6 +98,24 @@ inline size_t pool_give_back(size_t asked, size_t have, size_t free_after, size_
         give += g;
     }
     return std::min(give, asked);
+}
+
+// The written budget's frees, back as free VRAM (#899).  On Linux HIP (two RX 9070s) the free figure read right after
+// the check freed its pieces still counted them as in use - the card's free VRAM less the reserve, all of it - so the
+// pool sized next found 0 slots a layer while the split had planned 74.  `read` gives the free VRAM now, `pause` waits
+// a little between reads: the figure is read until it is back within `slack` of `free_before` (the free VRAM read
+// before the budget was written), at most `max_polls` pauses.  Returns the last read; `polls` the pauses it took.
+template <class Read, class Pause>
+inline size_t await_check_frees(size_t free_before, size_t slack, int max_polls, Read&& read, Pause&& pause,
+                                int& polls) {
+    polls = 0;
+    size_t fr = read();
+    while (fr + slack < free_before && polls < max_polls) {
+        pause();
+        ++polls;
+        fr = read();
+    }
+    return fr;
 }
 
 inline bool minimal_ram_tier(bool unified, bool all_experts_fit, bool explicit_budget) {
@@ -207,6 +236,33 @@ inline int64_t pin_cap_room(bool discrete_amd_windows, int64_t cap, int64_t room
     if (room_mb >= 0) return up(std::min<int64_t>(room_mb, int64_t{1} << 30) << 20);
     if (!discrete_amd_windows) return kRoom;
     return std::max(kRoom, up(std::max<int64_t>(0, cap) / 10));
+}
+
+// Whether the pinning cap is measured before the expert pool (#924, #1035).  On Windows with a discrete Radeon (HIP),
+// pinning host memory up to Windows' refusal while the card's VRAM is nearly full leaves the device unusable for the
+// rest of the process - the next upload fails ("unspecified launch failure") even once everything is freed - while
+// the same search with VRAM to spare is harmless (measured on an RX 7900 XT 20 GB with 64 GB of RAM).  So there the
+// cap is measured before the pool fills the card, the RAM tier is sized under it, and nothing pinned after the pool
+// goes up to a refusal.  Not on an APU (HIP does not refuse there: apu_shared_room sizes its tier), nor in a split
+// (its parts load at once: a later part's search would run with another card's pool in place).  `force`
+// (MAYA_GLM_PIN_MEASURE_FIRST): "0" off, "1" on for every one-GPU host (tests, with MAYA_GLM_PIN_CAP_MB).
+inline bool pin_cap_before_pool(bool windows_hip, bool integrated, int n_parts, const char* force) {
+    if (n_parts != 1) return false;
+    if (force != nullptr && force[0] != '\0') return std::atoi(force) != 0;
+    return windows_hip && !integrated;
+}
+
+// What more pins now under a cap measured earlier: what more pinned then, less what was pinned since (never below 0)
+inline int64_t pin_left_since(int64_t measured_more, int64_t pinned_since) {
+    return std::max<int64_t>(0, measured_more - std::max<int64_t>(0, pinned_since));
+}
+
+// A RAM tier class's slots under a pinning cap: `left` more pins, `keep` stays pinnable above the tier, `planned` the
+// bytes this class and the classes after it planned, `n` this class's planned slots.  Taken class by class (each one's
+// bytes off `left` before the next), the classes together never pass left - keep.
+inline int64_t pin_cap_share(int64_t left, int64_t keep, int64_t planned, int64_t n) {
+    const double f = (double) std::max<int64_t>(0, left - keep) / (double) std::max<int64_t>(1, planned);
+    return (int64_t) (f * (double) n);
 }
 
 // The shared GPU memory a Windows APU's RAM tier leaves free above it and what is pinned after it (glm_fast_path's

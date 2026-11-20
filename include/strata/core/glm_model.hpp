@@ -376,6 +376,8 @@ public:
     cudaStream_t hd_s_ = nullptr;      // ... the stream they run on (not hh_s_: behind a window's late picks there)
     int* hh_skip_d_ = nullptr;         // (the helper) its skip flag for a pick's half (a token past a wrong draft)
     static constexpr size_t kHdCandBytes = (size_t) 1 << 20;
+    float* slot_bounce_ = nullptr;     // AMD: slot_bounce()'s, pinned once
+    bool slot_bounce_tried_ = false;
     float* ht_x_h_ = nullptr;          // (the last part) pinned: the slots' head inputs, the helper's logits, pairs
     float* ht_lg_h_ = nullptr;
     int* ht_pair_h_ = nullptr;
@@ -696,6 +698,9 @@ public:
     // ... the same window on a linked helper (MAYA_GLM_LINK_WIN): one call for its helper experts (glm_fast_path.cu)
     void win_helper_merged(int il, int nb, const strata::kernels::glmf::MoeRequest* const* rq,
                            strata::kernels::glmf::CpuAnswer* const* ans, const unsigned int* seq);
+    // ... and in one call of the token path's kernels, each token its own plan (MAYA_GLM_LINK_MULTI; glm_fast_path.cu)
+    void win_helper_multi(int il, int nb, const strata::kernels::glmf::MoeRequest* const* rq,
+                          strata::kernels::glmf::CpuAnswer* const* ans, const unsigned int* seq);
     // ---- the NextN (MTP) draft block (the last half carries it; layer index n_layers)
     int mtp_il_ = -1;                                      // its layer index here, -1: not on this half
     int mtp_src_ = -1;                                     // the shard of MAYA_GLM_MTP_GGUF's block, -1: the model's
@@ -1101,6 +1106,7 @@ public:
     bool prefill_return(std::string& err);                  // ... and back to the expert pool
     void prefill_destroy();
     void prefill_cap(int T, const char* why);              // its pinned staging for chunks of at most T
+    float* slot_bounce();                                  // AMD: slot_save / slot_load's pinned bounce (nullptr: none)
     void prefill_settle(double pinned_share);              // --prefill auto's lend cap from the pinned share (85/90%)
     // a chunk's device buffers {kept rows, scratch}; kv_stage: the KV streaming stage's bytes (SIZE_MAX: the whole
     // context's, kv_stage_bytes_)

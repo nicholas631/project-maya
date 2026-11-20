@@ -626,6 +626,42 @@ __global__ void add_f32_kernel(float* __restrict__ y, const float* __restrict__ 
 
 }  // namespace
 
+// The prompt path's EXL3 lane for a caller outside it - the linked helper's prompt products (remote_experts.cpp's
+// pf_run_x3): a BLAS handle on the caller's stream, and one expert's rows through x3_run_blas (the weights decoded
+// once, the GEMMs in FP16): out[r] = the expert over x[row_tok[r]] for r < nrows (rows of E floats; out's rows hold
+// gate/up meanwhile).  w16: FP16 scratch of w16_elems values, at least 2 * nff * E and room for the rows' inputs.
+namespace glmpf {
+void* x3_blas_open(cudaStream_t s) {
+    cublasHandle_t h = nullptr;
+    if (cublasCreate(&h) != CUBLAS_STATUS_SUCCESS) return nullptr;
+    cublasSetStream(h, s);
+    cublasSetMathMode(h, CUBLAS_DEFAULT_MATH);
+    return (void*) h;
+}
+void x3_blas_close(void* blas) {
+    if (blas != nullptr) cublasDestroy((cublasHandle_t) blas);
+}
+void x3_expert_rows(void* blas, cudaStream_t s, uint16_t* w16, int64_t w16_elems, const uint8_t* blob,
+                    const strata::kernels::exl3::ExpertLayout& lay, int E, int nff, float limit, const float* x,
+                    const int* row_tok, int nrows, float* out) {
+    X3Lane L;
+    L.s = s;
+    L.blas = (cublasHandle_t) blas;
+    L.w16 = w16;
+    L.w16_elems = w16_elems;
+    L.x = x;
+    L.row_tok = row_tok;
+    L.OUTP = out;
+    L.W = nrows;
+    L.place = [](int, int) { return 0; };
+    L.lay = &lay;
+    L.E = E;
+    L.nff = nff;
+    L.limit = limit;
+    x3_run_blas(L, blob, 0, nrows, 0);
+}
+}  // namespace glmpf
+
 struct Glm5Model::PrefillState {
     int T = 0;                       // tokens per chunk
     // --prefill: the chunk and its prestage slots for a lend cap (% of the pool's slots), the cap it was sized with,
@@ -808,7 +844,30 @@ struct Glm5Model::PrefillState {
     std::vector<const char*> pname;
     size_t pn = 0;
     std::map<std::string, double> pacc;
+    // MAYA_GLM_PREFILL_CHECK=1 (diagnostic, off by default): the compute stream is synchronised after every stage of
+    // a layer and the first stage that ends with a CUDA error is named - with the device and the layer - once.  A
+    // fault inside a layer otherwise surfaces at the layer's first host sync (the route/count sync), whatever stage
+    // caused it.  Off, nothing below runs (the products and their order are the same either way; on, only the
+    // stream waits are added).
+    bool check = false;
+    bool check_said = false;
+    int check_dev = -1, check_il = -1, check_last_il = -1;
+    const char* check_last = "the chunk's start";
+    void check_stage(const char* nm, cudaStream_t st) {
+        if (!check || check_said) return;
+        const cudaError_t e = cudaStreamSynchronize(st);
+        if (e == cudaSuccess) {
+            check_last = nm;
+            check_last_il = check_il;
+            return;
+        }
+        check_said = true;
+        std::fprintf(stderr, "glm prefill check: CUDA%d layer %d: \"%s\" after the stage %s (the last clean stage: %s "
+                             "of layer %d) (MAYA_GLM_PREFILL_CHECK)\n",
+                     check_dev, check_il, cudaGetErrorString(e), nm, check_last, check_last_il);
+    }
     void mark(const char* nm, cudaStream_t st) {
+        check_stage(nm, st);
         if (!prof) return;
         if (pn >= pev.size()) {
             cudaEvent_t e = nullptr;
@@ -1115,6 +1174,11 @@ static std::pair<int64_t, int64_t> weight_scratch(const Glm5Geometry& g, bool ha
 #if defined(STRATA_USE_HIP)
     if (has_dsa)   // the MLA products' FP16 copy of wk_b / wv_b
         w16 = std::max<int64_t>({w16, (int64_t) g.n_head * g.kv_lora * g.qk_nope, (int64_t) g.n_head * g.v_head * g.kv_lora});
+    // MAYA_GLM_PREFILL_BLAS (the FP16 expert path) needs one expert's gate + up in FP16 and a row: 2 x ff x E + E.
+    // Make sure the scratch covers it on models where that exceeds the products above - only when the setting is on
+    // (HIP's default is 0, MMQ only): a default start keeps the scratch, and the pool's slots, as before
+    const char* blas = getenv("MAYA_GLM_PREFILL_BLAS");
+    if (blas != nullptr && std::atoi(blas) > 0) w16 = std::max<int64_t>(w16, (int64_t) 2 * g.n_ff_exp * E + E);
 #endif
     return {w16, w32};
 }
@@ -1206,6 +1270,12 @@ bool Glm5Model::prefill_setup(std::string& err) {
     if (const char* v = getenv("MAYA_GLM_PREFILL_SUB"))
         S->sub_env = std::clamp(std::atoi(v), 16, 8192);
     S->prof = getenv("MAYA_GLM_PREFILL_PROF") != nullptr;
+    if (const char* v = getenv("MAYA_GLM_PREFILL_CHECK"); v != nullptr && std::atoi(v) != 0) {
+        S->check = true;
+        S->check_dev = dev_;
+        std::fprintf(stderr, "glm prefill: CUDA%d MAYA_GLM_PREFILL_CHECK is on: every stage of a prompt layer is "
+                             "checked (slower prompts; a diagnostic)\n", dev_);
+    }
     S->gstride = gstride;
 
     // ---- sizes: the chunk T from the budget (per device)
@@ -2482,11 +2552,35 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     }();
     // repeatable answers (a linked helper): plans from fixed inputs, never from measured times (the CPU share below)
     const bool rep = glmfast::repeatable(F->helper.linked());
+    // An EXL3 pack's helper layers: every n-th (il % n == phase) streams its experts to this GPU instead of the helper
+    // computing them - the copy runs while the helper works on the layer before, so both links work at once (Radeon
+    // 8065S + V100, GLM-5.3-Flash EXL3 3.05: 2K prompts 128 tok/s all on the helper, 136 every 4th streamed, 149 every
+    // 2nd; 8K 218 / 264 / 328).  MAYA_GLM_LINK_PF_STREAM=<n>[,<phase>] (default 2,0; 0: all on the helper)
+    static const std::pair<int, int> pf_stream = [] {
+        const char* v = getenv("MAYA_GLM_LINK_PF_STREAM");
+        int n = 2, ph = 0;
+        if (v != nullptr && std::sscanf(v, "%d,%d", &n, &ph) < 1) n = 2;
+        if (n > 0 && v != nullptr)
+            std::fprintf(stderr, "glm prefill: an EXL3 pack's every %d-th layer (phase %d) streams its experts instead "
+                                 "of the helper (MAYA_GLM_LINK_PF_STREAM)\n", n, ph % n);
+        return std::make_pair(std::max(0, n), n > 0 ? ((ph % n) + n) % n : 0);
+    }();
+    // An EXL3 pack's chunk shorter than this streams the helper's experts to this GPU instead: the helper decodes each
+    // expert's whole weights for a call, so a short chunk's few rows an expert cost it more than the copy here (Radeon
+    // 8065S + V100: a 23-token chat prompt 2.7 s through the helper, 1.0 s streamed; 512 tokens 54 vs 92 tok/s, 1K 82
+    // vs 116; 2K 128 through the helper vs 80 streamed).  MAYA_GLM_LINK_PF_X3_MIN
+    static const int pf_x3_min = [] {
+        const char* v = getenv("MAYA_GLM_LINK_PF_X3_MIN");
+        return v != nullptr ? std::max(0, std::atoi(v)) : 1024;
+    }();
     const auto link_pf_for = [&](int il) {
         if (!link_pf_on || il < 0 || il >= g.n_layers || !F->helper.linked() || F->helper.pf_cap() < T ||
             K > hlink::kPfMaxK || g.n_expert > hlink::kPfMaxExperts)
             return false;
         const auto& Ly = F->L[(size_t) il];
+        if (Ly.moe && Ly.exl3)   // (an EXL3 pack: the helper's EXL3 prompt lane)
+            return T >= pf_x3_min && !(pf_stream.first > 0 && il % pf_stream.first == pf_stream.second) &&
+                   F->helper.pf_x3_ok();
         return Ly.moe && !Ly.exl3 && F->helper.pf_pair_ok(Ly.gu_type, Ly.d_type);
     };
     const auto prestage = [&](int il) {
@@ -2710,13 +2804,18 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 TB <= F->helper.pf_slot_cap() && C == nullptr && !S->trace && l0_ == 0 &&
                 l1_ == g.n_layers && split_next_ == nullptr;
     const auto pipe_moe = [&](int il) { return link_pf_for(il) && disk_only(il).empty(); };
+    // An EXL3 pack's helper layers run whole unless MAYA_GLM_PF_PIPE=1: the helper decodes each expert's weights for
+    // every call, so two halves decode them twice - measured on a Radeon 8065S + V100, the halves read a 2K prompt
+    // ~30 % slower and an 8K one no faster than whole chunks
+    const auto pipe_x3_whole = [&](int il) { return pipe_env != 1 && F->L[(size_t) il].exl3; };
     std::vector<char> pipe_l((size_t) std::max(0, l1_), 0);
     int pipe_n = 0;
     if (pipe)
         for (int il = l0_; il < l1_; ++il) {
             const auto& Ly = F->L[(size_t) il];
             const int nx = next_moe(il + 1);
-            pipe_l[(size_t) il] = !Ly.moe || (pipe_moe(il) && (nx >= l1_ || pipe_moe(nx)));
+            const auto ok = [&](int l) { return pipe_moe(l) && !pipe_x3_whole(l); };
+            pipe_l[(size_t) il] = !Ly.moe || (ok(il) && (nx >= l1_ || ok(nx)));
             pipe_n += Ly.moe && pipe_l[(size_t) il];
         }
     if (pipe_n == 0) pipe = false;
@@ -2806,6 +2905,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         const bool skip_output = tail_skip && il == g.n_layers - 1;
         const int slot = hh < 0 ? 0 : hh + 1;   // (the helper exchange's slot for these rows)
         HlpPend& H = hp[hh < 0 ? 2 : hh];
+        S->check_il = il;   // (MAYA_GLM_PREFILL_CHECK's layer)
         if (pipe)   // (the union scratch is reused: the other half's routes must have gone down to the helper)
             for (const auto& q : hp)
                 if (q.ev != nullptr) cudaStreamWaitEvent(s, q.ev, 0);
@@ -3144,7 +3244,13 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             gb::copy_i32((const int*) M.rw, (int*) S->crw_h, T * K, s);
         }
         S->mark("route", s);
-        if (!glmfast::cuda_ok(cudaStreamSynchronize(s), "glm prompt route/count sync", err)) return false;
+        if (const cudaError_t se = cudaStreamSynchronize(s); se != cudaSuccess) {
+            // (the device and the layer in the message: a fault from any earlier stage of the layer lands here)
+            const std::string what = "glm prompt route/count sync (CUDA" + std::to_string(dev_) + ", layer " +
+                                     std::to_string(il) + ")";
+            glmfast::cuda_ok(se, what.c_str(), err);
+            return false;
+        }
         int counted = 0;
         for (int e = 0; e < NE; ++e) counted += S->h_counts[e];
         if (counted != T * K) {
@@ -3503,6 +3609,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             const float lim = g.swiglu_exp;
             HlpPend* hpp = &H;
             std::mutex* mx = &link_mx;
+            const strata::kernels::exl3::ExpertLayout* xlp = Ly.exl3 ? &Ly.xl : nullptr;   // (the model's layer: it outlives the call)
             H.th = std::thread([=] {
                 cudaSetDevice(dev);
                 if (cudaEventSynchronize(hpp->ev) != cudaSuccess) {
@@ -3511,7 +3618,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     return;
                 }
                 std::lock_guard<std::mutex> lk(*mx);
-                hpp->ok = F->helper.pf_post(gu, dty, doff, lim, dsa, Tc, K, nh, nr, r0c, hpp->err, sl) &&
+                hpp->ok = F->helper.pf_post(gu, dty, doff, lim, dsa, Tc, K, nh, nr, r0c, hpp->err, sl, xlp) &&
                           F->helper.pf_wait(hpp->err, &hpp->ms);
             });
         }
@@ -3867,8 +3974,10 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                             gb::swiglu_rows(GU, GU, nrows, nff, g.swiglu_exp, s, 2 * nff);   // (in place: no T x K x n_ff buffer)
                         }
                     }
+                    S->check_stage(f16_gu ? "experts gate/up (FP16)" : "experts gate/up (MMQ)", s);   // (off: nothing)
                     if (f16_dn) {
                         f16_down(wbase, i0, i1, stride, hb, a, GU, GU);   // (the window rows MMQ's down writes: OUTP + o)
+                        S->check_stage("experts down (FP16)", s);
                         i0 = i1;
                         continue;
                     }
@@ -3889,6 +3998,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     dn.dst = M.OUTP + (size_t) (o - a) * E;
                     dn.ld_dst = E;
                     S->mq->run(dn, s);
+                    S->check_stage("experts down (MMQ)", s);
                 }
                 i0 = i1;
             }

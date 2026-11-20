@@ -60,7 +60,7 @@ function saidDeleted(x) {
 // (m.shown: the server's own name for a model whose API id does not say it all - GLM-5.3 (744B); others: from the id)
 const shownOf = (m) => m.shown || modelName(m.model);
 const titleOf = (m) => `${shownOf(m)} ${m.quant}`;
-const DRAFTS = {mtp: "MTP", dflash2: "DFlash2", dspark: "DSpark", none: "off"};
+const DRAFTS = {mtp: "MTP", dflash2: "DFlash2", dspark: "DSpark", dfly2: "DFly2", none: "off"};
 const size = (b) => (b >= 1e8 ? `${fmt(b / 1e9, b < 1e10 ? 1 : 0)} GB` : null);
 const setUpOn = (w) => {
   const d = w ? new Date(String(w).replace(" ", "T")) : null;
@@ -313,12 +313,12 @@ function AutoOr({label, k, d, dflt, unit, subLabel}) {
 // trained for: GET /api/models' context_range), with the same line under it (server.js' ctxHint). `cost`: the cache's
 // bytes per token as the draft sets it (ctxHint's win / whole / ram / vram); `keys`: the settings that change it - while
 // none does, the running model's line is the engine's own measurement, as in Settings
-function contextRow(m, d, ch, cost, keys = [], extra = null) {
+function contextRow(m, d, ch, cost, keys = [], extra = null, note = null) {
   const s = m.settings, r = m.context_range || {min: 4096, max: 262144, tested: 262144};
   const n = Number(d.context), now = Number(s.context), stops = ctxStopsIn(r, now, n);
   const warn = [n !== now && n > r.tested ? `Beyond ${ctxfmt(r.tested)} is untested on this engine.` : null, extra].filter(Boolean).join(" ");
   return html`<${Row} label="Context size" flag="--max-context" changed=${ch("context")} warn=${warn || null}
-    hint=${m.running ? "The same setting as Settings › Chat defaults › Context size: changed alone, the model reloads with it in place." : null}
+    hint=${[m.running ? "The same setting as Settings › Chat defaults › Context size: changed alone, the model reloads with it in place." : null, note].filter(Boolean).join(" ") || null}
     below=${html`<${CtxSlider} id=${`mdl-ctx-${m.file}`} label="" value=${n} now=${now} stops=${stops}
       hint=${ctxHint(n, {live: m.running && !ch(...keys), now, ...cost})} onChange=${(v) => setDraft({context: v})}/>`}/>`;
 }
@@ -366,6 +366,7 @@ function fieldsOf(m, d) {
     <${Num} label="VRAM kept free" value=${d.reserve_mib} ph=${glm ? "700" : "default"} unit="MiB / GPU" on=${(v) => setDraft({reserve_mib: v})}/><//>`;
   if (m.family === "minimax") return mm3Fields(m, d, s, ch, images, gpus);
   if (m.family === "qwen") return qwenFields(m, d, s, ch, gpus);
+  if (m.family === "hy4") return hy4Fields(m, d, s, ch, images, gpus);
   if (glm) {
     const ec = AutoOr({label: "Expert cache", k: "expert_cache", d, dflt: 1200, unit: "experts", subLabel: "Experts in the first GPU's pool"});
     const pf = AutoOr({label: "Prompt chunk", k: "prefill", d, dflt: 8192, unit: "tokens", subLabel: "Tokens a prompt is read in at a time"});
@@ -547,6 +548,53 @@ function qwenFields(m, d, s, ch, gpus) {
         hint="The attention cache's format: INT8 the setup's (the model card's own), FP16 exact, K8 V4 and Q4_0 smaller - more VRAM for experts at long contexts.">
         <${Seg} label="KV cache" value=${kv.id} options=${QWEN_KV.map((f) => ({id: f.id, label: f.label}))}
           onChange=${(v) => setDraft({kv: v})}/><//>`]},
+  ];
+}
+
+// Hy4-flash's (maya-hy4: it stops at a flag it does not know, so only its own are offered; text only).  Its cache's VRAM a
+// context token, on each GPU of a tensor-parallel group: 13 layers keep every position (maya.py's HY4_KV_BYTES)
+// (... and in the smaller rows the engine takes by itself where these do not fit: serve/models.py's kv_small_from;
+//  at a context KV streaming takes - kv_streamed: {ram: bytes a token, win: positions in VRAM} - the line counts RAM)
+const HY4_KV_BYTES = 16640, HY4_KV_SMALL_BYTES = 9568;
+function hy4Fields(m, d, s, ch, images, gpus) {
+  const mtp = m.choices.draft.includes("mtp"), dfly = m.choices.draft.includes("dfly2");
+  const tpIds = [...new Set(["auto", 0].concat([s.tp, d.tp].filter((t) => t !== "auto" && t != null).map(Number)))];
+  return [
+    {label: "Model", rows: [
+      contextRow(m, d, ch, (m.kv_streamed || {})[String(d.context)] ||
+        {vram: d.kv === "q8" || (m.kv_small_from && Number(d.context) >= m.kv_small_from) ? HY4_KV_SMALL_BYTES : HY4_KV_BYTES}, ["kv"], null,
+        m.context_more ? "A larger context needs more VRAM than this model's GPUs have." : null),
+      html`<${Row} label="Drafting" flag=${d.draft === "dfly2" ? "--dfly2" : "--mtp"} changed=${ch("draft")}
+        hint=${mtp || dfly ? (mtp ? "The model's own MTP block drafts a few tokens for the model to check: the same answers, about twice as fast on code. " : "") +
+            (dfly ? "DFly2, the model's small drafter (under 1 GB of VRAM, one GPU), drafts several tokens in one pass for the model to check: the same answers. " : "") +
+            "Off decodes token by token."
+          : "This pack names no MTP block."}>
+        <${Seg} label="Drafting" value=${d.draft} options=${[...(mtp ? [{id: "mtp", label: "MTP"}] : []), ...(dfly ? [{id: "dfly2", label: "DFly2"}] : []), {id: "none", label: "Off"}]}
+          onChange=${(v) => setDraft({draft: v})}/><//>`,
+      images,
+      html`<${Row} label="Answers at once" hint="Coming soon: Hy4-Flash answers one request at a time for now."/>`]},
+    {label: "GPUs and memory", rows: [gpus,
+      html`<${Row} label="Tensor parallel" flag="--tp" changed=${ch("tp")}
+        hint="Auto: every layer shared by the largest group of equal GPUs, the fastest GPU holding the head and the drafts; where no group fits, the layers split across the GPUs. Off always splits the layers."
+        warn=${typeof d.tp === "number" && d.tp > d.gpus.length ? `A group of ${d.tp} needs at least ${d.tp} GPUs picked.` : null}>
+        <${Seg} label="Tensor parallel" value=${d.tp} options=${tpIds.map((t) => ({id: t, label: t === "auto" ? "Auto" : t ? String(t) : "Off"}))}
+          onChange=${(v) => setDraft({tp: v})}/><//>`,
+      html`<${Row} label="VRAM kept free" flag="--reserve-gb" changed=${ch("reserve_gb")}
+        hint="Per GPU, beyond the engine's plan: for the driver, the desktop and other programs. Empty: the engine's own."
+        warn=${decimal(d.reserve_gb) ? null : "A number of GB, or empty for the default."}>
+        <${Dec} label="VRAM kept free" value=${d.reserve_gb} ph="default" unit="GB / GPU" on=${(v) => setDraft({reserve_gb: v})}/><//>`,
+      html`<${Row} label="KV cache" flag="--kv" changed=${ch("kv")}
+        hint="Auto, the default: F16 rows where the context fits with them, 8-bit rows only where it needs them. 8-bit: the smaller rows at every context - on a small card they leave room for the DFly2 drafter (the setup's --fast-drafting on): faster drafting, slightly different wording than the default.">
+        <${Seg} label="KV cache" value=${d.kv} options=${[{id: "auto", label: "Auto"}, ...(d.kv === "f16" || s.kv === "f16" ? [{id: "f16", label: "F16"}] : []), {id: "q8", label: "8-bit"}]}
+          onChange=${(v) => setDraft({kv: v})}/><//>`]},
+    {label: "Speed", rows: [
+      html`<${Row} label="Prompt chunk" flag="--chunk" changed=${ch("prefill_chunk")}
+        hint="The prompt tokens one pass reads at most: larger reads long prompts faster and takes more VRAM. Empty: the engine picks at every start - 4096, 2048 or 1024, the largest that fits beside the model and the pictures. On a small card, a new context size puts the setup's own chunk back unless you changed it here."
+        warn=${whole(d.prefill_chunk) ? null : "A whole number, or empty."}>
+        <${Num} label="Prompt chunk" value=${d.prefill_chunk} ph="auto" unit="tokens" on=${(v) => setDraft({prefill_chunk: v})}/><//>`,
+      html`<${Row} label="CPU threads" flag="--cpu-threads" changed=${ch("cpu_threads")} hint="The CPU lane's threads, which compute the experts VRAM does not hold. Empty: the engine picks."
+        warn=${whole(d.cpu_threads) ? null : "A whole number, or empty."}>
+        <${Num} label="CPU threads" value=${d.cpu_threads} ph="auto" unit="threads" on=${(v) => setDraft({cpu_threads: v})}/><//>`]},
   ];
 }
 

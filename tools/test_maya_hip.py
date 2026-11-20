@@ -33,7 +33,11 @@ class HipSetupTests(unittest.TestCase):
             patch.object(maya, "EXE", self.root / "build/maya"),
             patch.object(maya, "STAMP", self.root / "build/MAYA-BUILD.json"),
             patch.object(maya, "WIN", False),
-            patch.dict(os.environ, {"ROCM_PATH": str(self.rocm)}),
+            # a Linux PC on any test host (Windows' own HIP setup: WindowsHipSetupTests): the platform check reads
+            # sys.platform beside WIN, and MAYA_SH keeps main() from re-starting itself through ./maya.sh (/bin/sh)
+            # when the tests run on a Python outside a venv
+            patch.object(maya.sys, "platform", "linux"),
+            patch.dict(os.environ, {"ROCM_PATH": str(self.rocm), "MAYA_SH": "1"}),
             patch.object(maya.S, "amd_gpus", return_value=self.gpus),
             patch.object(maya.S, "gpus", side_effect=AssertionError("HIP must not query NVIDIA")),
             patch.object(maya.S, "is_wsl", return_value=False),
@@ -476,7 +480,8 @@ class HipSetupTests(unittest.TestCase):
         self.assertNotIn("CUDA_DEVICE_ORDER", env)
         self.assertEqual(env["MAYA_GLM_PREFILL_SUB"], "512")
         self.assertEqual(env["MAYA_GLM_RAM_GB"], "60")
-        self.assertEqual(env["LD_LIBRARY_PATH"], str(self.rocm / "lib"))
+        # (the server's child_env: the library folders go on the loader's search path of the OS the tests run on)
+        self.assertEqual(env["PATH" if os.name == "nt" else "LD_LIBRARY_PATH"], str(self.rocm / "lib"))
         self.assertIn("GPUs: R9700 32 GB, RX 7900 XT 20 GB", text)
         self.assertIn("GPUs [1, 0]", text)
 
@@ -669,6 +674,7 @@ class HipSetupTests(unittest.TestCase):
         (self.root / "build/MAYA-BUILD.json").write_text(json.dumps(stamp))
         with patch.object(maya.S, "out", return_value="NVIDIA V100") as query, \
                 patch.object(maya.S, "page_file_gb", return_value=None), \
+                patch.object(maya, "gpu_readings_report", return_value="GPU 0 Tesla P4: 11 of 11 readings given"), \
                 patch.object(maya.S, "amd_gpus", side_effect=AssertionError("CUDA must not query AMD")):
             self.assertEqual(maya.report("test"), 0)
         query.assert_any_call(["nvidia-smi", "--query-gpu=index,name,memory.total,memory.used,driver_version,"
@@ -677,6 +683,36 @@ class HipSetupTests(unittest.TestCase):
         text = (self.root / "maya-report.txt").read_text()
         self.assertIn(json.dumps(stamp), text)
         self.assertNotIn("## ROCm", text)
+        self.assertIn("## GPU readings (the Monitor's NVML reader, read now)\nGPU 0 Tesla P4: 11 of 11 readings given",
+                      text)
+
+    def test_report_hy4_pictures_and_the_readers_lines(self):
+        """A user's report said "images off" for Hy4-Flash while its engine read pictures: maya-hy4's tower is the
+        pack's (on unless --vision off), not a "vision" entry in the config.  And the GPU readings' lines are picked."""
+        pack = self.root / "Hy4-Flash-Maya-XS" / "pack"
+        pack.mkdir(parents=True)
+        (pack / "hy4.txt").write_text("n_layer 42\nvision.dim 1152\n")
+        for args, want in ((["--pack", str(pack), "--max-context", "262144"], "images on (read a picture at a time)"),
+                           (["--pack", str(pack), "--vision", "off"], "images off (--vision off)")):
+            with self.subTest(args=args):
+                path = self.root / "maya-hy4-flash-maya-xs.json"
+                path.write_text(json.dumps({"exe": str(self.root / "build/maya-hy4"), "args": args, "gpu": [1],
+                                            "installer": {"family": "hy4", "hy4_quant": "maya-xs"}}))
+                path.with_suffix(".log").write_text(
+                    "[maya] the GPU readings' NVML reader stopped (it ended, exit code 1; its last words: x); starting\n"
+                    "[maya] a GPU reading failed on GPU 0 (Tesla P4): power - TypeError: x - left out\n")
+                with patch.object(maya.S, "out", return_value=""), patch.object(maya.S, "page_file_gb", return_value=None), \
+                        patch.object(maya, "gpu_readings_report", return_value="-"):
+                    self.assertEqual(maya.report("test", "cuda", path), 0)
+                text = (self.root / "maya-report.txt").read_text()
+                self.assertIn(want, text)
+                self.assertIn("lines (last 80 of 2)", text)
+        (pack / "hy4.txt").write_text("n_layer 42\n")
+        path.write_text(json.dumps({"exe": "maya-hy4", "args": ["--pack", str(pack)], "installer": {"family": "hy4"}}))
+        with patch.object(maya.S, "out", return_value=""), patch.object(maya.S, "page_file_gb", return_value=None), \
+                patch.object(maya, "gpu_readings_report", return_value="-"):
+            maya.report("test", "cuda", path)
+        self.assertIn("images off (no vision tower in the pack)", (self.root / "maya-report.txt").read_text())
 
     def test_cli_backend_selects_hip_config_for_bench(self):
         hip = self.installed_config()
@@ -1075,6 +1111,17 @@ class Vs2026Hint(unittest.TestCase):
         self.assertFalse(maya.vs_2026(vs.format("2019")))
         self.assertFalse(maya.vs_2026(None))
         self.assertIn("2022", maya.VS2026_HIP_HINT)
+
+
+class UbuntuRocwmmaNote(unittest.TestCase):
+    """#899: Ubuntu's librocwmma-dev lacks the internal/ headers a WMMA build includes - the AMD doc says so and how
+    to build anyway."""
+
+    def test_the_amd_doc_has_the_note(self):
+        text = (Path(maya.__file__).resolve().parent / "docs" / "AMD_MAYA.md").read_text(encoding="utf-8")
+        for words in ("librocwmma-dev", "internal/accessors.hpp", "ROCm/rocWMMA", "CPLUS_INCLUDE_PATH",
+                      "repo.radeon.com"):
+            self.assertIn(words, text)
 
 
 if __name__ == "__main__":

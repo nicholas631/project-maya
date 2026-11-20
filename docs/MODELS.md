@@ -1,6 +1,6 @@
 # The models
 
-Maya runs four models, each on an engine built for it. This page has each one's files, what they need and what is
+Maya runs five models, each on an engine built for it. This page has each one's files, what they need and what is
 special about it. Back to the [README](../README.md).
 
 - [How the quants are named](#how-the-quants-are-named)
@@ -8,6 +8,7 @@ special about it. Back to the [README](../README.md).
 - [GLM-5.3 (744B)](#glm-53-744b)
 - [DeepSeek-V4.1-Flash-1017](#deepseek-v41-flash-1017)
 - [MiniMax-M3.1-Flash](#minimax-m31-flash)
+- [Hy4-Flash](#hy4-flash)
 - [Community quants of GLM-5.3-Flash](#community-quants-of-glm-53-flash)
 
 ## How the quants are named
@@ -54,7 +55,7 @@ On AMD, GLM-5.3-Flash reads pictures too: setup builds its image encoder for the
   (`--kv-streaming on`; `./maya.sh --setup` adds it to an existing config), so the VRAM holds more experts - at 512K
   on an RTX 3090, prompts 4-9x faster and decode +5%; 1M context fits one 3090 ([how](SETTINGS.md)).
 - **Faster answers with a DFlash2 drafter:** `./maya.sh --setup --draft dflash2` (NVIDIA RTX 30 / A100 and newer,
-  and one AMD Ryzen AI Max APU) downloads a small drafter that drafts up to 7 tokens a round and gives the same answers
+  and one AMD Ryzen AI Max APU) downloads a small drafter that drafts up to 7 tokens a round; the model checks every drafted token, so it only writes tokens it would pick itself
   - Maya-L +44% on nine GPUs and +12% on two (against the MTP block), +19% on one RTX 3090, +9% on a Radeon 8060S
   with unsloth's UD-IQ2_XXS ([how](SETTINGS.md#drafting-with-dflash2)). How much
   it gains depends on the PC: on one GPU that reads much of the model from RAM it is often slower. So a
@@ -113,7 +114,9 @@ results. See [the prompt format notes](deepseek-prompt-format.md) for API detail
   is read as it is. Engram tables a quant stored in its own INT4 layout (`U8` + `embed.scale`, as in the quants derived
   from Diffbot's mixed 3 bpw) are not read: the tables are DeepSeek's own and the quant leaves them unchanged, so put
   DeepSeek's FP8 shards 47 / 48 of deepseek-ai/DeepSeek-V4.1-Flash-1017 in their place. Shards that write their
-  tensors grouped by type instead of expert by expert stop the pack with that reason: rewrite them in expert order.
+  tensors grouped by type instead of expert by expert stop the pack with that reason: rewrite them in expert order
+  in place with `tools/ds4/reorder.py --model <model folder>` - the same tensors and bytes, each tensor's SHA-256
+  checked ([type-ordered shards, and Diffbot's 3 bpw](ds4-exl3-packs.md)).
 
 ### DeepSeek's options
 
@@ -178,6 +181,118 @@ pictures and drafting, on NVIDIA and AMD alike.
   own numbers in the monitor.
 
 Its engine settings: [SETTINGS.md](SETTINGS.md#minimax-m31-flash).
+
+## Hy4-Flash
+
+The setup also offers **[Hy4-Flash](https://huggingface.co/tencent/Hy4-flash)** (Tencent's Hy4-flash; 220 B
+parameters: a 155.5 B language backbone with 512 experts a layer, 63.5 B of n-gram "Engram" tables, a vision encoder
+and a drafter; the [Tencent Hy License](../LICENSE.hy4-flash): based on Apache-2.0, with extra commercial terms for large
+model-as-a-service providers) on an engine of its own (`maya-hy4`; base NVIDIA engine contributed by
+[@needmorevram](https://github.com/needmorevram), #1040): `./maya.sh --setup` and pick "Hy4-Flash", or
+`./maya.sh --setup --model hy4-flash-maya-xs` (also `--hy4-quant maya-xs`; Windows: `START-MAYA.bat`).
+
+| Files | Size | Runs on |
+| --- | ---: | --- |
+| **[Hy4-Flash · Maya-XS](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF)** (`hy4-flash-maya-xs`), Project Maya's own quant: the routed experts in 2 bits - for PCs with about 56-64 GB of RAM + VRAM | 44.8 GB, and the n-gram table (63.4 GB, on the SSD); about 110 GB of disk in all | NVIDIA from the V100 on (CUDA); Linux and Windows |
+| **[Hy4-Flash · Maya-S](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF)** (`hy4-flash-maya-s`): the routed experts in 2 bits on layers 1-23 and 3 bits on layers 24-41 - for PCs with about 68-80 GB of RAM + VRAM | 53.0 GB, and the same n-gram table; about 116 GB of disk in all | NVIDIA from the V100 on, cards from 12 GB; Linux and Windows |
+| **[Hy4-Flash · Maya-M](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF)** (`hy4-flash-maya-m`): the routed experts in 3 bits (4 bits on 7 layers) - for PCs with about 80-96 GB of RAM + VRAM | 68.4 GB, and the same n-gram table; about 132 GB of disk in all | NVIDIA from the V100 on, cards from 12 GB; Linux and Windows |
+| **[Hy4-Flash · Maya-L](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF)** (`hy4-flash-maya-l`): the routed experts in 4 bits (5 bits on 5 layers) - for PCs with about 104-128 GB of RAM + VRAM | 89.5 GB, and the same n-gram table; about 153 GB of disk in all | NVIDIA from the V100 on, cards from 12 GB; Linux and Windows |
+
+The setup recommends a size by the PC's RAM + VRAM. Quality figures are on
+the [model card](https://huggingface.co/peasantsmith/Hy4-Flash-Maya-GGUF).
+
+- **One n-gram table for every size:** Tencent's FP8 table, value for value (63.4 GB). It is downloaded once, stays
+  on the SSD and is read page by page while the model answers: it does not need to fit in memory and is never loaded
+  into RAM whole. Keep it on an SSD / NVMe, never a hard disk.
+- **AMD (Linux):** `./maya.sh --setup --backend hip --model hy4-flash-maya-xs`. Run by us on a Gorgon Halo (Radeon 8065S, `gfx1151`, ROCm 7.14) with the Radeon alone: Maya-XS and Maya-L with every expert in the GPU's memory, pictures, tool calls and both thinking levels. On a Strix Halo / Gorgon Halo the setup says whether the size sits in the GPU's memory whole ([MEMORY.md](MEMORY.md): 64 GB - Maya-XS, 96 GB - Maya-M, 128 GB - Maya-L). Radeon cards (`gfx1100`): the engine's AMD build was contributed by [@Cass67](https://github.com/Cass67), who ran Tencent's own Q4_K_M on four RX 7900 XT; we have not run such cards ourselves. With an AMD GPU on Windows it is experimental - the setup offers it and says so; we have not run it there ([AMD_MAYA.md](AMD_MAYA.md#hy4-flash-under-windows-experimental)).
+- **Memory:** RAM + VRAM of about 56-64 GB for Maya-XS (a rule of thumb: the model file plus 4-8 GB for the context).
+  With less it still runs, slower ([MEMORY.md](MEMORY.md)).
+- **VRAM:** everything but the routed experts has to fit in VRAM; the experts that do not fit are computed on the CPU
+  from RAM. Maya-XS needs about 8.7 / 9.0 / 9.8 GiB of free VRAM at 4K / 8K / 32K context. More VRAM puts more
+  experts on the GPU, which is faster.
+- **Cards of 8 GB:** for a card under about 10 GB the setup picks an "8 GB" layout of Maya-XS by itself - a second
+  model file with smaller attention weights (43.6 GB; slightly lower quality) that needs about 6.5 / 6.8 GiB of free
+  VRAM at 4K / 8K context, and about 7.0 / 7.1 GiB at 16K / 32K, where the engine keeps the context's cache in 8
+  bits by itself (the setup says so). A card with less than about 7 GB cannot run it.
+- **Set up for your PC:** the setup checks the PC, picks the layout and the context that fit the card (4K to 1M,
+  each offered where it fits the card's VRAM; run end to end up to 32K so far), downloads the model file and
+  the n-gram table from Maya's repo, builds the engine's index of them (the pack) and the engine, and writes
+  `maya-hy4-flash-maya-xs.json`. `--model-dir <folder>` uses files you already have (checked by size and sha256).
+- **Tencent's own settings:** temperature 0.9, top-p 1.0, no top-k, with the release's own chat template (inside the
+  GGUF). The model thinks at High (its default) or not at all (Off), so those are the two levels offered - a
+  request for another level runs at High; the thinking budget is 32768 tokens.
+- **Tool calls, the OpenAI- and Anthropic-compatible API and the dashboard** work as for the other models: its entry
+  on the Models page (load, unload, delete; context, GPUs, tensor parallel, prompt chunk, CPU threads, VRAM kept
+  free), and in the Monitor the
+  experts on the GPU against those computed on the CPU and the n-gram table's read time. The loop guard is on, as for
+  every model.
+- **Pictures:** the model's own vision tower runs in the engine (contributed by
+  [@needmorevram](https://github.com/needmorevram), #1051). The setup downloads Maya's vision file with the model
+  (0.8 GB, one for every size; `--no-vision` skips it). Its weights stay in the file; a picture takes up to 0.8 GB of
+  VRAM while it is read, lent by the engine's prompt buffers (idle while a picture is read): no VRAM is kept for
+  pictures, so every card that runs the model reads them at full size, 8 GB cards included, and the VRAM goes to the
+  model. Only where the tower does not load are pictures
+  off: the setup says so, text works as before, a picture sent is refused in plain words and a picture in a tool
+  result becomes a short note. Pictures up to 2048 x 2048 pixels (larger ones are scaled down), a square one 4,160 tokens of the context. Pictures only, no videos. Images on the Models page
+  turns them on or off.
+- **Drafting:** Maya's sizes draft with Tencent's MTP block, the same block Tencent's own GGUF files carry. It is
+  one extra file for every size (7.5 GB, in Maya's repo; the setup downloads it once and links it into each size's
+  folder). The block guesses the next tokens and the model checks every one, so Maya only writes tokens the model
+  itself would pick. It takes about 4 GB of VRAM on the main GPU, so the setup turns it on where that fits beside
+  the model's own parts (cards from about 16 GB at a 32K context) and leaves it off, saying so, on smaller cards.
+  `--drafting off` sets a size up without it; Drafting on the Models page switches it. Because the block takes VRAM
+  that would hold experts, other experts sit in VRAM than without it, and an answer can differ from a run without
+  the block.
+- **In llama.cpp:** the files also load there with its Hy4-flash pull request
+  ([ggml-org/llama.cpp #32517](https://github.com/ggml-org/llama.cpp/pull/32517), not merged yet).
+
+Not available for Hy4-Flash yet (the dashboard offers no switch for them):
+
+- **Several requests at once:** no `--parallel`; one request at a time for now.
+- **AMD and Mac:** NVIDIA only.
+
+### Tencent's own Q4_K_M (AngelSlim), with drafting
+
+The same setup also offers Tencent's own Q4_K_M from
+[AngelSlim's GGUF](https://huggingface.co/AngelSlim/Hy4-flash-GGUF) (the download's license file,
+`License_AngelSlim_model_and_dataset.txt`, and Tencent's model card give the terms), listed after Maya's sizes -
+contributed with the engine by [@needmorevram](https://github.com/needmorevram) (#1040), and run by him on Linux with
+NVIDIA RTX 30 / A100 and newer cards.
+
+**Set up:** `./maya.sh --setup --model hy4-flash-q4_k_m` (or pick Hy4-Flash in the setup's model list, then
+"Q4_K_M") checks the PC, builds `maya-hy4`, downloads the two files and the vision tower's (AngelSlim's
+`mmproj-Hy4-flash-bf16.gguf`, 1 GB; pinned, sha256-checked; `--model-dir <folder>` uses the ones you have), writes the
+pack and `maya-hy4-flash.json`; `./maya.sh` starts it. `--drafting off` sets it up without MTP drafting, `--no-vision`
+without pictures.
+
+| Files | Size | Runs on |
+| --- | ---: | --- |
+| AngelSlim's **Q4_K_M** (`Hy4-flash-Q4_K_M-00001-of-00002.gguf` and the n-gram table): Q4_K experts (Q6_K downs on 19 layers), Q8_0 elsewhere | 157 GiB | NVIDIA; run on RTX 30 / A100 and newer, Linux |
+
+- **Tensor parallel:** where two or more GPUs are of one kind, every layer runs on all of them at once (about twice
+  the layer split's decode speed on eight RTX 5060 Ti); the fastest GPU holds the head and the drafter and computes a
+  share of the experts.
+- **Where the experts live:** all of them in VRAM where they fit (about 108 GB); where they do not, each layer keeps
+  a share of its experts in VRAM (its most used, with an expert profile) and the CPU computes the others from the
+  model's file.
+- **Context:** up to 256K tested (the setup offers 32K to 256K, and 512K / 1M on cards of 20 / 40 GB and more). With tensor parallel every GPU of the group holds the
+  whole cache, so where 16-bit rows do not fit (256K on 16 GB cards) the engine keeps them in 8 bits.
+- **Drafting:** the model's own MTP block proposes up to three tokens a step and the model checks them - nearly twice
+  the decode speed on code, the same answers.
+- **Thinking and tools:** the GGUF's own template; the model thinks at High (its default) or not at all (Off), so those
+  are the two levels offered - a request for another level runs at High. Chat, thinking and tool calls through Maya's
+  OpenAI-compatible server.
+- **Pictures:** the model's own vision tower runs in the engine on the main GPU (its weights stay in RAM; a picture
+  takes up to 0.8 GB there while it is read, lent by the prompt buffers - none kept for pictures). Pictures up to 2048 x 2048 pixels (larger ones are
+  scaled down), a square one 4,160 tokens of the context; 1024 x 768 is read in about 0.25 s, the largest in about
+  5 s on an RTX 3090. Pictures only, no videos. Images on the Models page turns them off.
+- **The pack:** `python tools/hy4/pack_gguf.py --model <folder>` indexes the GGUF set and the vision tower's file
+  beside it (no weights copied).
+
+Other GGUF sets of the model are not offered by the setup; `tools/hy4/pack_gguf.py` indexes one by hand
+([SETTINGS.md](SETTINGS.md#hy4-flash)).
+
+Its engine settings: [SETTINGS.md](SETTINGS.md#hy4-flash).
 
 ## Community quants of GLM-5.3-Flash
 

@@ -15,6 +15,7 @@ emoji (4-byte), combining marks, whitespace runs, and C0 control bytes.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import pathlib
 import sys
@@ -42,6 +43,17 @@ def bytes_to_unicode() -> dict[int, str]:
 
 BYTE_TO_UNICODE = bytes_to_unicode()
 UNICODE_TO_BYTE = {v: k for k, v in BYTE_TO_UNICODE.items()}
+
+
+def _vocab_fingerprint(tokens, ids) -> str:
+    """A digest of the token table and its reverse map as they stand: the same on every call while they are
+    untouched, something else once memory corruption has scribbled either (see Tokenizer.corruption_note)."""
+    h = hashlib.sha1()
+    for t in tokens:
+        h.update(t.encode("utf-8", "surrogatepass"))
+        h.update(b"\0")
+    h.update(str(len(ids)).encode())
+    return h.hexdigest()[:16]
 
 # The `qwen35` pre-tokenizer, transcribed from the ORACLE rather than from the family resemblance:
 # `.ref/llama.cpp/src/llama-vocab.cpp` L396, `case LLAMA_VOCAB_PRE_TYPE_QWEN35`.  The commented-out line
@@ -95,6 +107,9 @@ DEEPSEEK3_PATTERNS = (
     r"[!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+"
     r"| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
 )
+# `hy_v4` (Hy4-flash's tokenizer) splits with these same three stages, word for word (the HUNYUAN_DENSE expressions,
+# which are DEEPSEEK3_LLM's), merges by rank
+PRE_ISOLATED = {"deepseek3": DEEPSEEK3_PATTERNS, "hy_v4": DEEPSEEK3_PATTERNS}
 
 
 # The `minimax` pre-tokenizer: MiniMax-M3.1's tokenizer.json verbatim - an NFC normalizer, then one Split (invert,
@@ -141,9 +156,9 @@ class Tokenizer:
         self.pre = pre
         # Each supported scheme names a transcription of the vendored llama.cpp reference; an
         # unknown scheme is REFUSED rather than silently tokenized with the wrong splits.
-        if pre not in ("qwen35", "glm4", "glm5", "deepseek3", "minimax"):
-            raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, glm4, glm5, deepseek3, minimax"
-                             % pre)
+        if pre not in ("qwen35", "glm4", "glm5", "deepseek3", "minimax", "hy_v4"):
+            raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, glm4, glm5, deepseek3, minimax, "
+                             "hy_v4" % pre)
         # glm4/glm5 set ignore_merges: an exact vocab hit emits the whole pre-token piece
         self.ignore_merges = pre in ("glm4", "glm5")
         self.token_types = token_types
@@ -152,6 +167,7 @@ class Tokenizer:
         if len(self.ids) != len(tokens):
             raise ValueError("vocabulary has duplicate tokens: %d entries, %d unique"
                              % (len(tokens), len(self.ids)))
+        self._loaded_fingerprint = _vocab_fingerprint(self.tokens, self.ids)
         # Merge rules as (left, right) -> rank.  A merge list that is not a total order over its pairs, or one
         # naming a token that is not in the vocabulary, would make BPE silently produce different ids than the
         # model was trained with, so both are checked here rather than discovered as a bad answer later.
@@ -163,7 +179,7 @@ class Tokenizer:
             if parts[0] not in self.ids or parts[1] not in self.ids:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
-        self._re = (_IsolatedSplits(DEEPSEEK3_PATTERNS) if pre == "deepseek3" else
+        self._re = (_IsolatedSplits(PRE_ISOLATED[pre]) if pre in PRE_ISOLATED else
                     regex.compile(MINIMAX_PATTERN) if pre == "minimax" else
                     regex.compile(GLM_PATTERN if self.ignore_merges else QWEN35_PATTERN))
         self._nfc = pre == "minimax"
@@ -197,6 +213,17 @@ class Tokenizer:
             return None
         return regex.compile("|".join(regex.escape(s) for s in sorted(literals, key=len, reverse=True)))
 
+    def corruption_note(self) -> str:
+        """An empty string when the token tables still match what __init__ loaded, else the words an error should carry.  The
+        tables are never written after load, so a difference is memory corruption in this process, not a bad file -
+        2026-11-16: a server's in-memory table grew NUL bytes and lost entries after days of uptime (the same files
+        encode fine in a fresh process), and the bare KeyErrors it raised read like a broken vocabulary.  The fix is
+        a restart, so say that rather than leave callers to suspect the model files."""
+        if _vocab_fingerprint(self.tokens, self.ids) == self._loaded_fingerprint:
+            return ""
+        return ("; the token table changed in memory after load (heap corruption in this process) - "
+                "restart the process")
+
     # -------------------------------------------------------------- constructors
     @classmethod
     def from_dir(cls, path) -> "Tokenizer":
@@ -210,8 +237,13 @@ class Tokenizer:
             tokens[i] = s
         meta = json.loads((t / "tokenizer.json").read_text(encoding="utf-8")) if (t / "tokenizer.json").exists() else {}
         types = json.loads((t / "token_type.json").read_text()) if (t / "token_type.json").exists() else None
-        return cls(tokens, (t / "merges.txt").read_text(encoding="utf-8").split("\n"), types,
-                   meta.get("pre", "qwen35"), meta.get("special_ids") or None)
+        tk = cls(tokens, (t / "merges.txt").read_text(encoding="utf-8").split("\n"), types,
+                 meta.get("pre", "qwen35"), meta.get("special_ids") or None)
+        # "aliases" {id: text}: the text an output token stands for in what the server reads (token_bytes) - Hy4-flash's
+        # suffixed tags under GLM's spelling (<think:6124c78e> -> <think>, its <tool_calls:..> wrapper -> nothing);
+        # prompts still encode the tokens by their own text
+        tk.aliases = {int(k): v for k, v in (meta.get("aliases") or {}).items()}
+        return tk
 
     @classmethod
     def from_gguf(cls, path) -> "Tokenizer":
@@ -278,7 +310,8 @@ class Tokenizer:
                 for tok in self._bpe(mapped):
                     i = self.ids.get(tok)
                     if i is None:
-                        raise KeyError("BPE produced a token outside the vocabulary: %r" % tok)
+                        raise KeyError("BPE produced a token outside the vocabulary: %r%s"
+                                       % (tok, self.corruption_note()))
                     got.append(i)
                 ids = tuple(got)
             memo[piece] = ids
@@ -364,7 +397,12 @@ class Tokenizer:
         b = cache.get(i)
         if b is None:
             if i < 0 or i >= len(self.tokens):
-                raise IndexError("token id %d is outside the vocabulary (%d)" % (i, len(self.tokens)))
+                raise IndexError("token id %d is outside the vocabulary (%d)%s"
+                                 % (i, len(self.tokens), self.corruption_note()))
+            alias = self.__dict__.get("aliases", {}).get(i)
+            if alias is not None:
+                b = cache[i] = alias.encode("utf-8")
+                return b
             if self.token_types and self.token_types[i] in (3, 4):
                 # a control / user-defined token is its text as is (llama.cpp's token_to_piece): GLM's are ASCII,
                 # where the byte alphabet is the identity, DeepSeek's (<｜User｜>, ｜DSML｜) are not
@@ -374,7 +412,8 @@ class Tokenizer:
             for ch in self.tokens[i]:
                 v = UNICODE_TO_BYTE.get(ch)
                 if v is None:
-                    raise KeyError("token %d contains a character outside the byte alphabet: %r" % (i, ch))
+                    raise KeyError("token %d contains a character outside the byte alphabet: %r%s"
+                                   % (i, ch, self.corruption_note()))
                 raw.append(v)
             b = cache[i] = bytes(raw)
         return b

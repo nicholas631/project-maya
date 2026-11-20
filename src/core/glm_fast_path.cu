@@ -39,6 +39,7 @@
 #include "strata/kernels/cpu/exl3_ref.hpp"
 #include "strata/platform/env_switch.hpp"
 #include "strata/platform/idle_gate.hpp"
+#include "strata/platform/stall_watch.hpp"   // #860: the drafting decode's stall report
 
 #include "ggml.h"
 
@@ -631,6 +632,14 @@ static int64_t avail_ram_now() {
 #endif
 }
 
+// the RAM the tier leaves free for the OS, the server and the page cache (MAYA_GLM_RAM_HEADROOM_GB): 6 GB, 16 GB
+// where the GPU's memory is the system's
+static int64_t ram_headroom_b(bool unified) {
+    double head_gb = unified ? 16.0 : 6.0;
+    if (const char* h = getenv("MAYA_GLM_RAM_HEADROOM_GB")) head_gb = std::max(0.0, std::atof(h));
+    return (int64_t) (head_gb * 1073741824.0);
+}
+
 static void numa_pinned_free(void* p, size_t bytes) {
 #ifdef __linux__
     cudaHostUnregister(p);
@@ -1174,6 +1183,15 @@ bool Glm5Model::fast_setup(std::string& err) {
     F->resp_h = (gf::MoeResponse*) hp;
     cudaHostGetDevicePointer(&dp, hp, 0);
     F->md.resp = dp;
+    // the stall report's view of the device's given-up waits (#860); without it the waits only stay unreported
+    if (cudaHostAlloc((void**) &F->wait_diag_h, 8 * sizeof(unsigned int), cudaHostAllocMapped) == cudaSuccess) {
+        std::memset(F->wait_diag_h, 0, 8 * sizeof(unsigned int));
+        void* wd = nullptr;
+        if (cudaHostGetDevicePointer(&wd, F->wait_diag_h, 0) == cudaSuccess) F->md.wait_diag = (unsigned int*) wd;
+    } else {
+        cudaGetLastError();
+        F->wait_diag_h = nullptr;
+    }
     if (cudaHostAlloc((void**) &F->emb_h, (size_t) E * sizeof(float), cudaHostAllocDefault) != cudaSuccess ||
         cudaHostAlloc((void**) &F->hop_h, glmres::res_hop_bytes(g), cudaHostAllocDefault) != cudaSuccess ||
         cudaHostAlloc((void**) &F->tok_h, 64, cudaHostAllocDefault) != cudaSuccess) {
@@ -1332,6 +1350,39 @@ bool Glm5Model::fast_setup(std::string& err) {
         pool_check(floor_b, stride_max, all_b);
         // the batched prompt path: its sizes (it borrows the pool's tail, see below)
         if (!prefill_setup(err)) return false;
+        // #924 / #1035 (Windows, a discrete Radeon, one GPU): the pinning cap measured now, while the card still has
+        // room - searched for once the expert pool fills the card, Windows' refusal left the device unusable (the
+        // warmed tables' upload then failed).  Probed up to what the RAM tier could take (the free RAM less the
+        // headroom, or the size set) with the room kept above it and the small buffers pinned before it; the tier
+        // is sized under it below (glmfast::pin_cap_before_pool)
+        int64_t pre_more = -1, pre_held = 0;
+        const int64_t pre_small = (int64_t) (FastState::kMaxUpd * (sizeof(int) + sizeof(unsigned long long))) +
+                                  (int64_t) g.n_exp_used * (int64_t) sstride;   // (the table updates', the staging)
+        {
+#if defined(STRATA_USE_HIP) && defined(_WIN32)
+            const bool win_hip = true;
+#else
+            const bool win_hip = false;
+#endif
+            int integrated = 0;
+            if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev_) != cudaSuccess) cudaGetLastError();
+            if (glmfast::pin_cap_before_pool(win_hip, integrated != 0 || F->unified_memory, n_parts_,
+                                             getenv("MAYA_GLM_PIN_MEASURE_FIRST"))) {
+                const char* rg = getenv("MAYA_GLM_RAM_GB");
+                const char* rm = getenv("MAYA_GLM_PIN_ROOM_MB");
+                int64_t want = ram_budget_ >= 0 ? ram_budget_
+                             : rg != nullptr  ? (int64_t) (std::atof(rg) * 1073741824.0)
+                                              : std::max<int64_t>(0, avail_ram_now() - ram_headroom_b(F->unified_memory));
+                want += glmfast::pin_cap_room(true, want, rm != nullptr ? std::atoll(rm) : -1) + pre_small;
+                const auto t0 = std::chrono::steady_clock::now();
+                pre_held = g_pin_held;
+                pre_more = pin_room(want);
+                std::fprintf(stderr, "glm fast: CUDA%d pinning measured before the expert pool: %.2f GB more pin%s (%.1f s)\n",
+                             dev_, (double) pre_more / 1073741824.0,
+                             pre_more + ((int64_t) 256 << 20) <= want ? ", Windows' limit" : ", all the RAM tier can take",
+                             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+            }
+        }
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
         {
@@ -1431,22 +1482,84 @@ bool Glm5Model::fast_setup(std::string& err) {
             if (tot <= avail) break;
             --per;
         }
+        // NO POOL (a small card: the VRAM left after the dense weights and the state holds fewer slots a layer than a
+        // route has experts): the start used to stop here.  It goes on without a pool instead - no expert is resident
+        // in VRAM, none is promoted, and every routed expert of every token is served the way a miss already is: the
+        // CPU lane computes it from the RAM tier, or it crosses PCIe into the device's 8 scratch slots (the lane's own
+        // measured split; a disk-only one through the staging buffers) - the same kernels and the same bytes as any
+        // other start's misses, only for all of them.  Slower, never wrong.  The batched prompt path has no tail to
+        // borrow (token by token) and the one-GPU MTP decode's verify rows would each cost their experts in full
+        // (off).  Only where the start would stop: a pool that holds a route starts as before.  Not on a layer split,
+        // with a DFlash drafter or with --parallel (their windows and rows share the scratch slots; untested), nor
+        // on unified memory (its pool is RAM: none left means none for the RAM tier either), nor - until one is tested -
+        // an EXL3 pack or a glm-dsa model: those keep the refusal.
+        // MAYA_GLM_NO_POOL=0 keeps the refusal everywhere.
+        bool no_pool = false;
+        std::string np_note;   // the refusal's: why the start without a pool is not taken
         if (per < g.n_exp_used) {
+            const char* const np_env = getenv("MAYA_GLM_NO_POOL");
+            const char* const np_why = np_env != nullptr && std::atoi(np_env) == 0 ? "MAYA_GLM_NO_POOL=0 is set"
+                                       : n_parts_ != 1     ? "the model is split over several GPUs"
+                                       : dflash_on_        ? "a DFlash drafter is loaded - start without it"
+                                       : seq_count() > 1   ? "--parallel is above 1 - start with --parallel 1"
+                                       : F->unified_memory ? "this GPU's memory is the system's RAM"
+                                       : exl3_             ? "it is not tested with EXL3 packs yet"
+                                       : g_.arch == GlmArch::GlmDsa ? "it is not tested with GLM-5.3 (744B) yet"
+                                                           : nullptr;
+            no_pool = np_why == nullptr;
+            if (!no_pool)
+                np_note = std::string(". The start without an expert pool (every expert from RAM, slower) is not "
+                                      "available here: ") + np_why;
+        }
+        if (no_pool) {
+            const size_t need = (size_t) g.n_exp_used * stride_sum;
+            const size_t short_mib = ((need > avail ? need - avail : 0) >> 20) + 1;
+            std::fprintf(stderr, "glm fast: CUDA%d: no room for an expert pool (%d slots a layer fit, a route needs %d - "
+                                 "about %zu MiB short; the budget was %zu MiB, the free VRAM less the %zu MiB reserve): "
+                                 "starting WITHOUT one - every expert is computed on the CPU from RAM or streamed to "
+                                 "the GPU for its token. The model is the same; decoding and prompt reading are much "
+                                 "slower than on a card that holds a pool\n",
+                         dev_, per, g.n_exp_used, short_mib, avail >> 20, reserve >> 20);
+            if (mtp_dec_) {
+                mtp_dec_ = false;
+                std::fprintf(stderr, "glm fast: CUDA%d: no expert pool - MTP drafting is off (a verify row would cost "
+                                     "its experts in full)\n", dev_);
+            }
+            per = 0;
+            avail = 0;
+        } else if (per < g.n_exp_used) {
             // what is short, and what makes room
             const size_t need = (size_t) g.n_exp_used * stride_sum;
             const size_t short_mib = ((need > avail ? need - avail : 0) >> 20) + 1;
+            // (#899) a smaller reserve is named only where it can make the room (glmfast::reserve_hint); a reserve set
+            // by hand also keeps the start from lowering the default one on a small card (pool_reserve)
+            const std::string res_flag = part_ > 0 && getenv("MAYA_GLM_RESERVE_LATER_MB") ? "--vram-reserve-later-mib"
+                                                                                           : "--vram-reserve-mib";
+            const size_t res_mib = reserve >> 20;
+            const glmfast::ReserveHint hint =
+                glmfast::reserve_hint(pool_b_.reserve_given, avail, need > avail ? need - avail : 0, reserve);
+            const bool res_helps = hint == glmfast::ReserveHint::smaller;
+            const std::string by_hand = "a reserve set by hand also turns off the start's automatic lowering of the "
+                                        "default reserve on a small card (leave " + res_flag + " out to get it)";
             err = "glm fast: CUDA" + std::to_string(dev_) + " has no room for the expert pool: " + std::to_string(per) +
                   " slots a layer, at least " + std::to_string(g.n_exp_used) + " needed (about " +
-                  std::to_string(short_mib) + " MiB more). To make room: " +
+                  std::to_string(short_mib) + " MiB more; the pool's budget was " + std::to_string(avail >> 20) +
+                  " MiB, the free VRAM less the " + std::to_string(res_mib) + " MiB reserve). To make room: " +
                   (pool_b_.fixed > 0 ? "a larger --expert-cache (" + std::to_string(pool_b_.fixed) + " now) or auto, "
                                      : std::string()) +
-                  (pool_b_.reserve_given
-                       ? std::string(part_ > 0 && getenv("MAYA_GLM_RESERVE_LATER_MB") ? "a smaller --vram-reserve-later-mib ("
-                                                                                       : "a smaller --vram-reserve-mib (") +
-                             std::to_string(reserve >> 20) + " now), "
-                       : std::string()) +
+                  (res_helps ? "a smaller " + res_flag + " (" + std::to_string(res_mib) + " now; " + by_hand + "), "
+                             : std::string()) +
                   "a smaller --max-context, " + (kv_int8() ? "" : "--kv int8, ") +
-                  (kv_ != nullptr ? "" : "--kv-streaming on, ") + "or close other programs that use the GPU";
+                  (kv_ != nullptr ? "" : "--kv-streaming on, ") + "or close other programs that use the GPU" +
+                  (hint == glmfast::ReserveHint::budget_zero || hint == glmfast::ReserveHint::short_beyond
+                       ? ". A smaller " + res_flag + " cannot make this room: " +
+                             (hint == glmfast::ReserveHint::budget_zero ? std::string("the budget measured 0 - the free VRAM read after the dense "
+                                                       "weights and state was no more than the reserve, so the VRAM "
+                                                       "is held by something else (the VRAM line above)")
+                                         : "more is short than the whole " + std::to_string(res_mib) + " MiB reserve") +
+                             "; " + by_hand
+                       : std::string());
+            err += np_note;
             return false;
         }
         // the prompt path borrows the pool's TAIL: the last k slots of every layer, laid out as one region after all
@@ -1474,7 +1587,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             if (const char* v = getenv("MAYA_GLM_VISION_LEND_MB"); v != nullptr && dev_ == 0)
                 k_full = std::max(k_full, tail_slots((size_t) std::max(0LL, std::atoll(v)) << 20));
             const bool uni = F->unified_memory;
-            const int full = glmfast::complete_pool_on() && (!uni || glmfast::unified_complete_pool())
+            const int full = !no_pool && glmfast::complete_pool_on() && (!uni || glmfast::unified_complete_pool())
                                  ? glmfast::complete_pool_slots(uni ? room_u : avail, stride_sum, g.n_expert,
                                                                 gf::kSpares, k_full)
                                  : 0;
@@ -1489,6 +1602,9 @@ bool Glm5Model::fast_setup(std::string& err) {
                 }
             }
         }
+        if (no_pool)   // (whether prefill_setup above sized a chunk or not)
+            std::fprintf(stderr, "glm prefill: CUDA%d no expert pool - the batched prompt path is off, prompts are read "
+                                 "token by token\n", dev_);
         if (pf_ != nullptr) {
             k_extra = tail_slots(prefill_borrow_bytes());
             // (the prestage buffer is the part that can shrink: to what the pool can lend, else none)
@@ -1497,9 +1613,10 @@ bool Glm5Model::fast_setup(std::string& err) {
             if (k_extra > k_max && k_max > 0) k_extra = tail_slots(prefill_trim_prestage((size_t) k_max * stride_sum));
             // (a prompt runs alone - no decode beside it, unlike the vision encoder's lending below - so its main
             // slots need little more than one route's experts and the spares)
-            if (per - k_extra < k_keep) {
+            if (!no_pool && per - k_extra < k_keep)
                 std::fprintf(stderr, "glm prefill: CUDA%d the pool (%d slots/layer) cannot lend %zu MB - token by token\n",
                              dev_, per, prefill_borrow_bytes() >> 20);
+            if (no_pool || per - k_extra < k_keep) {
                 prefill_destroy();
                 k_extra = 0;
             }
@@ -1540,7 +1657,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         // layer rather than spending the capped budget on uneven partitions/spares
         // (a complete pool likewise: every layer already holds all of its experts).
         if (getenv("MAYA_GLM_UNIFORM_SLOTS") == nullptr && !(F->unified_memory && per == g.n_expert) &&
-            !F->complete) {
+            !F->complete && !no_pool) {
             std::vector<std::vector<double>> share((size_t) NL);
             // a profile's ranking as shares: each layer's experts in profile order, valued 1 / (1 + their rank in
             // the whole profile) - the split below then gives the next slot to the layer whose next expert ranks
@@ -1646,7 +1763,9 @@ bool Glm5Model::fast_setup(std::string& err) {
         std::vector<uint8_t*> segs;
         std::vector<int> seg_of((size_t) NL, 0);
         const size_t main_bytes = tot - xtot;
-        if (uint8_t* one = nullptr; glmd::mmq_malloc((void**) &one, main_bytes) == 0) {   // glm-dsa B15.2: zeroed, 512-B tail
+        if (no_pool) {
+            segs.push_back(nullptr);   // (no slots: nothing to allocate - P.base stays null and P.n 0 in every layer)
+        } else if (uint8_t* one = nullptr; glmd::mmq_malloc((void**) &one, main_bytes) == 0) {   // glm-dsa B15.2: zeroed, 512-B tail
             segs.push_back(one);
         } else {
             cudaGetLastError();
@@ -1816,9 +1935,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         const int later = n_parts_ - 1 - part_;   // the parts that start after this one
         const int64_t unseen_pf = (int64_t) std::max(0, later - 1) * (int64_t) pinned_pf.staging +
                                   (int64_t) std::max(0, later - 1) * (int64_t) pinned_pf.hop;
-        double head_gb = F->unified_memory ? 16.0 : 6.0;
-        if (const char* h = getenv("MAYA_GLM_RAM_HEADROOM_GB")) head_gb = std::max(0.0, std::atof(h));
-        const int64_t head_b = (int64_t) (head_gb * 1073741824.0);
+        const int64_t head_b = ram_headroom_b(F->unified_memory);
         const bool fixed_ram = getenv("MAYA_GLM_RAM_GB") != nullptr;
         if (budget < 0) {
             if (total < 0) {
@@ -1990,9 +2107,20 @@ bool Glm5Model::fast_setup(std::string& err) {
         const auto share = [&](size_t c) {
             int64_t planned = 0;
             for (size_t k = c; k < cls_n.size(); ++k) planned += cls_n[k] * (int64_t) cls_stride[k];
-            const double f = (double) std::max<int64_t>(0, pin_left - pin_keep()) / (double) std::max<int64_t>(1, planned);
-            return (int64_t) (f * (double) cls_n[c]);
+            return glmfast::pin_cap_share(pin_left, pin_keep(), planned, cls_n[c]);
         };
+        // a cap measured before the expert pool (#924): every class sized under it from the start, less what was pinned
+        // since (the table updates, the staging) - no pin after the pool goes up to a refusal
+        if (pre_more >= 0) {
+            pin_left = glmfast::pin_left_since(pre_more, g_pin_held - pre_held + pre_small);
+            pin_cap = g_pin_held + pin_left;
+            std::fprintf(stderr, "glm fast: CUDA%d a pinning cap: %.2f GB more pin (measured before the expert pool), %s "
+                                 "(%.2f GB kept free above it)\n",
+                         dev_, (double) pin_left / 1073741824.0,
+                         balanced_ram ? "mandatory RAM slots retained" : "the RAM tier sized to it",
+                         (double) pin_keep() / 1073741824.0);
+        }
+        bool pre_refused = false;
         // a class pinned in pieces of at most MAYA_GLM_PIN_PIECE_MB (Windows: 1024 by default; 0: one block, as on
         // Linux): a block of many GB takes far more of Windows' per-process pinning budget than its size - 61 GB pin in
         // 1 GB pieces where the largest single block is ~21 GB - so a 2-GPU split's first part left its second 0 GB and
@@ -2069,6 +2197,9 @@ bool Glm5Model::fast_setup(std::string& err) {
                     break;
                 }
                 if ((p = pin_tier(R, n)) != nullptr) {
+                    // (a cap measured before the pool: the class was sized under it with the room kept - not probed
+                    // here, where a refusal would break a Radeon under Windows, #924)
+                    if (pre_more >= 0 && !balanced_ram) break;
                     // ... and leave room under the cap: a pageable copy needs pinned buffers of the driver's own, and
                     // with two tiers pinned right up to it the warmed tables' upload failed (#105).  512 MB more that
                     // will not pin: a step less.  (A larger room is probed in pieces, pin_room.)
@@ -2084,6 +2215,14 @@ bool Glm5Model::fast_setup(std::string& err) {
                 }
                 cudaGetLastError();
                 p = nullptr;
+                if (pre_more >= 0 && !pre_refused) {
+                    pre_refused = true;
+                    std::fprintf(stderr, "glm fast: WARNING - CUDA%d: Windows refused the RAM tier's %.2f GB under the "
+                                         "pinning cap measured before the expert pool (it moved since); on a Radeon "
+                                         "this can stop the start (\"unspecified launch failure\") - if it does, set "
+                                         "MAYA_GLM_RAM_GB a few GB under that cap\n",
+                                 dev_, (double) n * (double) R.stride / 1073741824.0);
+                }
                 if (pin_left < 0) {
                     int64_t planned = 0;
                     for (size_t k = c; k < cls_n.size(); ++k) planned += cls_n[k] * (int64_t) cls_stride[k];
@@ -2293,6 +2432,7 @@ bool Glm5Model::fast_setup_finish(std::string& err) {
     F->lane_pending = false;
     cudaSetDevice(dev_);
     if (!fast_cpu_lane_setup(err)) return false;   // keep the existing CPU pool/calibration for batched prefill
+    if (n_parts_ == 1 && split_next_ == nullptr) (void) slot_bounce();   // AMD: at start-up (a split's: at its first switch)
     if (const char* h = getenv("MAYA_GLM_EXPERT_HELPER"); h != nullptr && h[0] != '\0')
         if (!fast_helper_setup(err)) return false;
     F->svc = std::thread([this] { fast_service(); });
@@ -2321,7 +2461,7 @@ bool Glm5Model::fast_helper_setup(std::string& err) {
     std::vector<std::pair<void*, size_t>> regions;
     for (const auto& r : F->rc)
         for (size_t i = 0; i < r.n_parts(); ++i) regions.push_back({r.part(i), r.part_slots(i) * r.stride});
-    if (exl3_helper) {
+    if (exl3_helper && device != strata::core::GlmExpertHelper::kLinkDevice) {   // (a linked helper: its own program's GPU)
         // a Pascal helper (sm_61 / 62: FP16 at 1/64 of its F32 rate) decodes with legacy-f32 - v1.1.8's kernels, the
         // same bits, ~5.5x faster there (a P4000, 6 experts: 3.87 -> 0.69 ms) - unless MAYA_GLM_EXL3_DECODE<n> or
         // MAYA_GLM_EXL3_DECODE names its kernels; the trunk GPUs keep their own choice
@@ -3198,6 +3338,85 @@ void Glm5Model::win_helper_merged(int il, int nb, const gf::MoeRequest* const* r
     }
 }
 
+// A verify window's layer on the linked helper in one call of the token path's kernels (MAYA_GLM_LINK_MULTI;
+// GlmExpertHelper::win_post / win_wait): each token's helper experts as its own plan, in its route's order - what the
+// call a token sends, for all the tokens at once.  The experts the helper does not own run on this thread's CPU lane
+// meanwhile and are added after the helper's sum, as the call a token adds them: every answer is that path's bit for
+// bit.  A call that cannot go (or fails) is answered as that path answers a failed call: no helper part, the helper
+// marked failed.
+void Glm5Model::win_helper_multi(int il, int nb, const gf::MoeRequest* const* rq, gf::CpuAnswer* const* ans,
+                                 const unsigned int* seq) {
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    const auto& ly = F->L[(size_t) il];
+    const int K = g.n_exp_used, E = g.n_embd, NE = g.n_expert;
+    const auto t0 = std::chrono::steady_clock::now();
+    int hn[kWinMax] = {}, hkeys[kWinMax * 8];
+    float hw[kWinMax * 8];
+    const float* hx[kWinMax];
+    float* hout[kWinMax];
+    int cn[kWinMax] = {};
+    const uint8_t* cblob[kWinMax][8];
+    float cw[kWinMax][8];
+    int rows = 0;
+    for (int j = 0; j < nb; ++j) {
+        hx[j] = rq[j]->x;
+        hout[j] = ans[j]->part;
+        for (int i = 0; i < K; ++i) {
+            if (!((rq[j]->cpu_mask >> i) & 1u)) continue;
+            const int key = il * NE + rq[j]->ids[i];
+            if (F->helper.owns(key)) {
+                hkeys[8 * j + hn[j]] = key;
+                hw[8 * j + hn[j]++] = rq[j]->w[i];
+                ++rows;
+            } else {   // the CPU lane's: its RAM-tier blob, as the call a token takes it
+                cblob[j][cn[j]] = (const uint8_t*) rq[j]->cpu_src[i];
+                cw[j][cn[j]++] = rq[j]->w[i];
+            }
+        }
+    }
+    bool posted = false;
+    if (rows > 0 && !F->helper_failed.load(std::memory_order_acquire)) {
+        posted = F->helper.win_post(ly.gu_type, ly.d_type, ly.down_off, g.swiglu_exp, nb, hn, hkeys, hw, hx,
+                                    F->helper_error);
+        if (!posted) F->helper_failed.store(true, std::memory_order_release);
+    }
+    // the CPU lane's experts meanwhile (each token's own, in its plan order)
+    static thread_local std::vector<float> cpu_buf;
+    if (cpu_buf.size() < (size_t) kWinMax * E) cpu_buf.assign((size_t) kWinMax * E, 0.0f);
+    const auto cpu_part = [&](int j) { return cpu_buf.data() + (size_t) j * E; };
+    int cpu_ne = 0;
+    for (int j = 0; j < nb; ++j)
+        if (cn[j] > 0) {
+            fast_cpu_experts(il, cn[j], cblob[j], cw[j], rq[j]->x, cpu_part(j));
+            cpu_ne += cn[j];
+        }
+    // (tokens without a helper expert keep a zero part, as the call a token leaves it; a failed call zeroes all)
+    for (int j = 0; j < nb; ++j)
+        if (hn[j] == 0) std::fill_n(ans[j]->part, E, 0.0f);
+    bool got = posted;
+    if (posted && !F->helper.win_wait(nb, hn, hout, F->helper_error)) {
+        got = false;
+        F->helper_failed.store(true, std::memory_order_release);
+    }
+    for (int j = 0; j < nb; ++j) {
+        float* p = ans[j]->part;
+        if (!got && hn[j] > 0) std::fill_n(p, E, 0.0f);
+        if (cn[j] > 0)
+            for (int e = 0; e < E; ++e) p[e] += cpu_part(j)[e];
+    }
+    std::atomic_thread_fence(std::memory_order_release);
+    for (int j = 0; j < nb; ++j) ans[j]->seq = seq[j];
+    F->helper_experts.fetch_add((uint64_t) rows, std::memory_order_relaxed);
+    F->helper_routes.fetch_add(rows > 0, std::memory_order_relaxed);
+    F->helper_us.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                               std::chrono::steady_clock::now() - t0).count(), std::memory_order_relaxed);
+    if (cpu_ne > 0) {
+        F->cpu_experts.fetch_add((uint64_t) cpu_ne, std::memory_order_relaxed);
+        F->cpu_routes.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 void Glm5Model::win_cpu_merged(int il, int nb, const gf::MoeRequest* const* rq, gf::CpuAnswer* const* ans,
                                const unsigned int* seq) {
     FastState* F = fast_;
@@ -3980,6 +4199,19 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         for (double* v : {&c_ms, &p_ms, &ps_ms}) *v = std::round(*v * 1e4) / 1e4;
     if (!cal_key.empty()) cal_put(calf, cal_key, cal_vals(c_ms, p_ms, ps_ms, 0.0));
     }
+    // repeatable answers: every plan that splits experts between the CPU lane and PCIe (the decode's lane plan, the
+    // prompts' staged split and prestage) sees the timing in coarse steps - powers of two - so two builds or installs
+    // whose timing of the same CPU and link differs by a few percent (0.1072 vs 0.1112 ms an expert, one build to the
+    // next) plan the same split and give the same answers.  A step's edges lie a factor 1.41 apart from its value; only
+    // a timing within a few percent of an edge can still land either side.  The cache keeps the measured values
+    // (MAYA_GLM_LANE_STEPS=0: the measured values, as before)
+    if (glmfast::repeatable(F->helper.linked()) && glmfast::lane_steps()) {
+        const double c0 = c_ms, p0 = p_ms, s0 = ps_ms;
+        for (double* v : {&c_ms, &p_ms, &ps_ms})
+            if (*v > 0.0) *v = std::exp2(std::round(std::log2(*v)));
+        std::fprintf(stderr, "glm fast: CUDA%d repeatable answers: lane timing in steps %.4f/%.4f/%.4f -> %.4f/%.4f/%.4f "
+                             "ms (MAYA_GLM_LANE_STEPS)\n", dev_, c0, p0, s0, c_ms, p_ms, ps_ms);
+    }
     F->cpu_c_ms = c_ms;   // (the prompt path splits its staged experts by them too)
     F->cpu_p_ms = p_ms;
     F->cpu_ps_ms = ps_ms;
@@ -4696,6 +4928,7 @@ void Glm5Model::fast_destroy() {
     if (F->upd_val_d) cudaFree(F->upd_val_d);
     if (F->ring_h) cudaFreeHost(F->ring_h);
     if (F->resp_h) cudaFreeHost(F->resp_h);
+    if (F->wait_diag_h) cudaFreeHost(F->wait_diag_h);
     if (F->md.route_err_d) cudaFree(F->md.route_err_d);
     if (F->emb_h) cudaFreeHost(F->emb_h);
     if (F->hop_h) cudaFreeHost(F->hop_h);
@@ -4979,6 +5212,19 @@ void Glm5Model::fast_service() {
     }();
     static const int kDeepS = strata::platform::idle_env("MAYA_GLM_SERVICE_DEEP_S", 60);
     static const int kDeepMs = std::max(1, strata::platform::idle_env("MAYA_GLM_SERVICE_DEEP_MS", 100));
+    // the two sleeps' lengths (issue #951): MAYA_GLM_SERVICE_NAP_US (100; Windows 1000) and
+    // MAYA_GLM_SERVICE_SLEEP_MS (2) - longer sleeps wake an idle engine less, the first route after a quiet spell
+    // waits up to one of them
+    static const int kNapUs = strata::platform::idle_sleep_setting(
+        getenv("MAYA_GLM_SERVICE_NAP_US"),
+#ifdef _WIN32
+        1000,
+#else
+        100,
+#endif
+        strata::platform::kIdleNapUsMin, strata::platform::kIdleNapUsMax);
+    static const int kSleepMs = strata::platform::idle_sleep_setting(
+        getenv("MAYA_GLM_SERVICE_SLEEP_MS"), 2, strata::platform::kIdleSleepMsMin, strata::platform::kIdleSleepMsMax);
     strata::platform::IdleGate& gate = strata::platform::idle_gate();
     uint64_t gate_seen = 0;
     auto last_route = std::chrono::steady_clock::now();
@@ -5002,11 +5248,82 @@ void Glm5Model::fast_service() {
         const char* v = getenv("MAYA_GLM_LINK_WIN");
         return v != nullptr && std::atoi(v) != 0;
     }();
+    // MAYA_GLM_LINK_MULTI (a linked helper whose program has the window call - GlmExpertHelper::win_cap): a verify
+    // window's routes are held until the layer's last token routed, then all the tokens' helper experts go to the
+    // helper in ONE call (win_helper_multi) - each token with its own plan on the token path's kernels, so every
+    // answer is the call-a-token's bit for bit, and an expert several tokens route is read from RAM once instead of
+    // once a token.  auto (the default): both ways are timed on this machine - the time from a layer's first route
+    // reaching this thread to its last answer, kMultiBlock layers at a time in turn, kMultiBlocks blocks each, the
+    // slowest block of each dropped - and the faster one stays; said once.  1 / 0 force.  The choice moves no bit of
+    // any answer.
+    static const int multi_env = [] {
+        const char* v = getenv("MAYA_GLM_LINK_MULTI");
+        if (v == nullptr || v[0] == '\0' || std::string(v) == "auto") return -1;
+        return std::atoi(v) != 0 ? 1 : 0;
+    }();
+    constexpr int kMultiBlock = 32, kMultiBlocks = 8, kMultiShapes = 6;
+    // (a layer's shape: its first token and the window's end - a whole window's layer, or one staggered group's; each
+    // shape is measured and decided for itself, so a window layout that changes meanwhile mixes nothing)
+    struct MShape {
+        int key = -1, mode = -1, layers = 0;   // mode: -1 measuring, 0 a call a token, 1 one call a layer
+        double blk[2][kMultiBlocks] = {};      // each way's blocks, ms
+    };
+    MShape m_sh[kMultiShapes];
+    MShape* m_s = nullptr;                  // the open layer's shape (null: none left - a call a token)
+    const int m_mode = multi_env;           // -1 measured a shape, 0 a call a token, 1 one call a layer
+    bool m_cur = multi_env == 1;            // this layer's way (set at its first route)
+    bool m_open = false, w_multi = false;   // inside a layer's routes; the held window goes to win_helper_multi
+    int m_layer = -1;                       // the open layer
+    std::chrono::steady_clock::time_point m_t0{}, m_t1{};   // the layer's first route here; its last route here
+    // MAYA_GLM_PROF: each way's layers, and their time from the first route to the last route and from there to the
+    // last answer (printed when this thread ends)
+    const bool m_prof = getenv("MAYA_GLM_PROF") != nullptr;
+    unsigned long long m_pn[2] = {};
+    double m_pr[2] = {}, m_pa[2] = {};
+    const auto multi_open = [&](int first, int end) {   // a layer's first route: its shape and its way
+        m_open = true;
+        m_s = nullptr;
+        const int key = first * 64 + end;
+        for (auto& sh : m_sh) {
+            if (sh.key < 0) sh.key = key;
+            if (sh.key == key) { m_s = &sh; break; }
+        }
+        const int mode = m_mode >= 0 ? m_mode : m_s != nullptr ? m_s->mode : 0;
+        m_cur = mode == 1 || (mode < 0 && ((m_s->layers / kMultiBlock) & 1) != 0);
+        m_t0 = std::chrono::steady_clock::now();
+    };
+    const auto multi_done = [&] {           // a layer's last answer is out
+        if (!m_open) return;
+        m_open = false;
+        const auto now = std::chrono::steady_clock::now();
+        if (m_prof) {
+            ++m_pn[m_cur];
+            m_pr[m_cur] += std::chrono::duration<double, std::milli>(m_t1 - m_t0).count();
+            m_pa[m_cur] += std::chrono::duration<double, std::milli>(now - m_t1).count();
+        }
+        if (m_mode >= 0 || m_s == nullptr || m_s->mode >= 0) return;
+        MShape& sh = *m_s;
+        const int b = sh.layers / kMultiBlock;
+        sh.blk[b & 1][b >> 1] += std::chrono::duration<double, std::milli>(now - m_t0).count();
+        if (++sh.layers < 2 * kMultiBlock * kMultiBlocks) return;
+        double sum[2] = {}, worst[2] = {};
+        for (int w = 0; w < 2; ++w)
+            for (int i = 0; i < kMultiBlocks; ++i) sum[w] += sh.blk[w][i], worst[w] = std::max(worst[w], sh.blk[w][i]);
+        const double per = (double) (kMultiBlock * (kMultiBlocks - 1));
+        const double one = (sum[0] - worst[0]) / per, all = (sum[1] - worst[1]) / per;
+        sh.mode = all < one ? 1 : 0;
+        std::fprintf(stderr, "glm helper link: a window layer's helper experts measured (tokens %d to %d) - a call a token "
+                             "%.3f ms, one call a layer %.3f ms (first route to last answer) -> %s "
+                             "(MAYA_GLM_LINK_MULTI=1 / 0 force)\n", sh.key / 64, sh.key % 64 - 1, one, all,
+                     sh.mode == 1 ? "one call a layer" : "a call a token");
+    };
     const auto win_flush = [&] {
-        if (w_n > 0 && w_link) win_helper_merged(w_rq[0]->layer, w_n, w_rq, w_ans, w_seq);
+        if (w_n > 0 && w_multi) win_helper_multi(w_rq[0]->layer, w_n, w_rq, w_ans, w_seq);
+        else if (w_n > 0 && w_link) win_helper_merged(w_rq[0]->layer, w_n, w_rq, w_ans, w_seq);
         else if (w_n > 0) win_cpu_merged(w_rq[0]->layer, w_n, w_rq, w_ans, w_seq);
         F->processed.fetch_add((uint64_t) w_held, std::memory_order_release);
         w_n = w_held = 0;
+        multi_done();
     };
     unsigned int polls = 0;
     const unsigned int ring_n = F->md.ring_n, ring_stride = F->md.ring_stride;   // (fast_setup: the ring's shape)
@@ -5026,6 +5343,7 @@ void Glm5Model::fast_service() {
                 F->processed.fetch_add((uint64_t) (sq - next), std::memory_order_release);
                 next = sq;
             } else {
+                F->svc_phase.store(0, std::memory_order_relaxed);
 #if defined(_WIN32) && defined(STRATA_USE_HIP)
                 // Windows' HIP runtime submits queued launches only when the host waits on the GPU (Linux submits
                 // each): a route the main thread queued can sit there while this thread waits for it.  After 1 ms
@@ -5053,13 +5371,9 @@ void Glm5Model::fast_service() {
                     if (kDeepS > 0 && std::chrono::steady_clock::now() - last_route > std::chrono::seconds(kDeepS))
                         idle = 3;
                     else
-                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                        std::this_thread::sleep_for(std::chrono::milliseconds(kSleepMs));
                 } else if (idle == 1) {
-#ifdef _WIN32
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-#else
-                    std::this_thread::sleep_for(std::chrono::microseconds(100));
-#endif
+                    std::this_thread::sleep_for(std::chrono::microseconds(kNapUs));
                     if ((++polls & 255u) == 0 &&
                         std::chrono::steady_clock::now() - last_route > std::chrono::milliseconds(10 * kIdleMs))
                         idle = 2;
@@ -5077,6 +5391,8 @@ void Glm5Model::fast_service() {
             last_route = std::chrono::steady_clock::now();
         }
         std::atomic_thread_fence(std::memory_order_acquire);
+        F->svc_next.store(next, std::memory_order_relaxed);   // (the stall report's view of this thread)
+        F->svc_phase.store(1, std::memory_order_relaxed);
         // MAYA_GLM_PF_CE: this route's prefetch copies first, on the copy engine, then its seq into the flag on the
         // same stream (the flag lands after the experts; the next layer waits for it)
         if (F->pf_ce && rq->error == 0 && rq->pf_n > 0 && rq->layer + 1 < (int) F->layer_rc.size() &&
@@ -5096,6 +5412,13 @@ void Glm5Model::fast_service() {
             unsigned int* sv = F->pfce_seq_h + (sq % gf::kRingSize);
             *sv = sq;
             cudaMemcpyAsync(F->pf_flag_d, sv, sizeof(unsigned int), cudaMemcpyHostToDevice, F->pfce_stream);
+            // Windows' HIP runtime holds queued work until the host waits on or queries its stream (docs/AMD_MAYA.md,
+            // "Kernel submission"), and nothing else touches this one: without the query the flag never lands and the
+            // next layer's moe_pf_wait spins on it ("token N waiting > 10 s" on an RX 7900 XT).  It returns at once;
+            // "not ready" is not an error and is not left behind for the next check.
+#if defined(STRATA_USE_HIP)
+            if (cudaStreamQuery(F->pfce_stream) == cudaErrorNotReady) cudaGetLastError();
+#endif
         }
         // (the lanes are made at the CPU lane's setup, after this thread started; an EXL3 pack's merged rows with them)
         // A batched rows step's group (MAYA_GLM_GROUP_EXPERTS, win_rows) is held the same way and merged on this part's
@@ -5104,18 +5427,32 @@ void Glm5Model::fast_service() {
                            F->helper.pf_cap() >= kWinMax && !F->L[(size_t) rq->layer].exl3 &&
                            F->helper.pf_pair_ok(F->L[(size_t) rq->layer].gu_type, F->L[(size_t) rq->layer].d_type) &&
                            !F->helper_failed.load(std::memory_order_acquire);
-        const bool held = lheld ||
+        // the window call's layers (above): a window of several tokens, native experts, the helper's program has the
+        // call.  A layer keeps one way from its first route to its last answer
+        const bool m_ok = !lheld && (m_mode != 0 || m_prof) && rq->win_n > 1 && rq->win_rows == 0 &&
+                          F->cpu_ans_h != nullptr && F->helper.win_cap() >= kWinMax &&
+                          !F->L[(size_t) rq->layer].exl3 && !F->helper_failed.load(std::memory_order_acquire);
+        if (m_open && w_held == 0 && rq->layer != m_layer) m_open = false;   // (a layer that never ended: not measured)
+        if (m_ok && !m_open && rq->win_n - rq->win >= 2) {   // (two tokens or more)
+            multi_open(rq->win, rq->win_n);
+            m_layer = rq->layer;
+        }
+        const bool mheld = (m_ok && m_open && m_cur) || (w_held > 0 && w_multi);   // (a layer begun held ends held)
+        const bool m_last = m_open && rq->win >= rq->win_n - 1;   // (a call a token: the layer ends at this route)
+        if (m_last) m_t1 = std::chrono::steady_clock::now();
+        const bool held = lheld || mheld ||
                           (win_merge && rq->win_n > 0 && F->cpu_ans_h != nullptr && !F->cpu_win.dn.empty() &&
                            (!exl3_ || !F->cpu_win.x3.empty()) &&
                            (rq->win_rows != 0 ? F->cpu_pool != nullptr && F->helper.device() < 0
                                               : F->win_lane[0] != nullptr && F->win_lane[1] != nullptr));
-        if (held && w_held == 0) w_link = lheld;
+        if (held && w_held == 0) w_link = lheld, w_multi = mheld;
         if (rq->error != 0) {
             if (held) {   // a window token's invalid route: nothing to compute, but it may be the layer's last
                 ++w_held;
                 if (rq->win >= rq->win_n - 1 || w_held >= kWinMax) win_flush();
             } else {
                 F->processed.fetch_add(1, std::memory_order_release);
+                if (m_last) multi_done();
             }
             ++next;
             continue;
@@ -5297,7 +5634,9 @@ void Glm5Model::fast_service() {
                         bool draining = false;
                         for (const auto& d : F->draining)
                             if (d.rclass == cls && d.rslot == rs) {
+                                F->svc_phase.store(4, std::memory_order_relaxed);   // (#860: the stall line's phase)
                                 cudaEventSynchronize(d.ev);
+                                F->svc_phase.store(1, std::memory_order_relaxed);
                                 draining = true;
                                 break;
                             }
@@ -5361,9 +5700,11 @@ void Glm5Model::fast_service() {
                 const int rch = F->read_chunks > 0 ? F->read_chunks : rch_env;
                 const auto wait_ahead = [&] {   // the lookahead's reads in flight for this route land outside its jobs
                     const auto tw = std::chrono::steady_clock::now();
+                    F->svc_phase.store(3, std::memory_order_relaxed);   // (#860: the stall line's phase)
                     for (int i = 0; i < nw; ++i)
                         while ((F->rload[(size_t) cls][(size_t) wt[i]].load(std::memory_order_acquire) & 3u) != 2u)
                             cpu_relax();
+                    F->svc_phase.store(1, std::memory_order_relaxed);
                     F->ah_waited += (uint64_t) nw;
                     F->ah_wait_us.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
                                                 std::chrono::steady_clock::now() - tw).count(),
@@ -5462,6 +5803,7 @@ void Glm5Model::fast_service() {
             continue;
         }
         if (rq->cpu_mask != 0u && F->cpu_ans_h != nullptr) {
+            F->svc_phase.store(2, std::memory_order_relaxed);
             const auto t0 = std::chrono::steady_clock::now();
             const unsigned int cm = rq->cpu_mask;
             int ne = 0;
@@ -5587,8 +5929,16 @@ void Glm5Model::fast_service() {
             }
         }
         F->processed.fetch_add(1, std::memory_order_release);
+        if (m_last) multi_done();
         ++next;
     }
+    if (m_prof && m_pn[0] + m_pn[1] > 0)
+        for (int w = 0; w < 2; ++w)
+            if (m_pn[w] > 0)
+                std::fprintf(stderr, "glm helper link prof: %llu window layers with %s - first route to last route %.3f "
+                                     "ms, last route to last answer %.3f ms a layer (this thread's clock)\n", m_pn[w],
+                             w == 1 ? "one call a layer" : "a call a token", m_pr[w] / (double) m_pn[w],
+                             m_pa[w] / (double) m_pn[w]);
 }
 
 // a whole EXL3 expert into its blob: the nine pieces sorted by file offset, those less than 64 KB apart read as one
@@ -7463,6 +7813,49 @@ void Glm5Model::pool_check(size_t floor_b, size_t slot_b, size_t all_b) {
         size_t fr = 0, tot = 0;
         cudaMemGetInfo(&fr, &tot);
         for (void* p : got) cudaFree(p);
+#if defined(STRATA_USE_HIP) && !defined(_WIN32)
+        // (#899) Linux HIP: the frees above can land late - the free VRAM read just after them still counted the
+        // whole budget as in use, and the pool fast_setup sized next found 0 slots a layer (2x RX 9070, the head
+        // part).  Wait until the free figure is back (within 256 MiB of the read before the write; a sync and a tiny
+        // write each 5 ms, at most MAYA_GLM_POOL_CHECK_WAIT_MS, default 10000; 0: no wait).  CUDA builds: unchanged.
+        {
+            int wait_ms = 10000;
+            if (const char* v = getenv("MAYA_GLM_POOL_CHECK_WAIT_MS")) wait_ms = std::max(0, std::atoi(v));
+            void* probe = nullptr;
+            if (cudaMalloc(&probe, 256) != cudaSuccess) {
+                cudaGetLastError();
+                probe = nullptr;
+            }
+            int polls = 0;
+            const auto t0 = std::chrono::steady_clock::now();
+            const size_t now = glmfast::await_check_frees(
+                free_b, (size_t) 256 << 20, wait_ms / 5,
+                [&] {
+                    cudaDeviceSynchronize();
+                    size_t f = 0, t = 0;
+                    cudaMemGetInfo(&f, &t);
+                    return f;
+                },
+                [&] {
+                    if (probe != nullptr) cudaMemset(probe, 0, 256);   // (a submission retires the queue's old work)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                },
+                polls);
+            if (probe != nullptr) cudaFree(probe);
+            if (polls > 0) {
+                const long long ms = (long long) std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         std::chrono::steady_clock::now() - t0).count();
+                if (now + ((size_t) 256 << 20) >= free_b)
+                    std::fprintf(stderr, "glm fast: CUDA%d the expert pool's check: its %.2f GB came back as free "
+                                         "VRAM %lld ms after it was freed\n", dev_, (double) have / 1073741824.0, ms);
+                else
+                    std::fprintf(stderr, "glm fast: CUDA%d WARNING the expert pool's check: %.2f GB of its %.2f GB "
+                                         "still read as in use %lld ms after it was freed (MAYA_GLM_POOL_CHECK=0 skips "
+                                         "the check)\n", dev_, (double) (free_b - now) / 1073741824.0,
+                                 (double) have / 1073741824.0, ms);
+            }
+        }
+#endif
         // MAYA_GLM_POOL_CHECK_TEST_MB=N (a test): the free figure read before the budget ran N MiB high, as Windows'
         if (const char* t = getenv("MAYA_GLM_POOL_CHECK_TEST_MB")) {
             const size_t hi = (size_t) std::max(0LL, std::atoll(t)) << 20;
@@ -8036,6 +8429,44 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
     Glm5Model* hl = spec_head_last();
     Glm5Model* B = hl->split_next_.get();     // the tail group's first part (spec_tail runs from it)
     Glm5Model* TL = spec_tail_last();         // its last: the token, the logits and the draft block live there
+    // #860: a step that stalls past MAYA_GLM_STALL_S seconds (20; 0 = off) says on stderr where each part of the split
+    // is - the device's given-up waits for the host, the service thread's routes and what it does.  Two atomic stores a
+    // phase and a watcher thread that wakes once a second; nothing the decode computes changes
+    strata::platform::StallWatch stall(strata::platform::stall_limit_s(), [this](const char* phase, double sec) {
+        // (3, 4: the two places a route's service waits on something else - a look-ahead read another thread has in
+        //  hand, the copy of an expert demoted at the last boundary)
+        static const char* const svc[5] = {"waiting for a route", "on a route", "in its CPU lane",
+                                           "on a route, waiting for a look-ahead read to land",
+                                           "on a route, waiting for a demoted expert's copy"};
+        static const char* const kinds[6] = {"-", "a route's answer", "the CPU lane's answer", "a deferred CPU answer",
+                                             "a rows step's CPU answer", "a route's answer (wait+fetch)"};
+        std::string line = "glm stall: a drafting step has run " + std::to_string((int) sec) + " s (" + phase + ")";
+        for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+            FastState* Fm = m->fast_;
+            if (Fm == nullptr) continue;
+            const unsigned int done = Fm->svc_next.load(std::memory_order_relaxed);
+            const int ph = std::min(4, std::max(0, Fm->svc_phase.load(std::memory_order_relaxed)));
+            unsigned int posted = 0u;
+            if (Fm->ring_h != nullptr)
+                posted = ((volatile const gf::MoeRequest*) gf::ring_entry(Fm->ring_h, done + 1u, Fm->md.ring_n,
+                                                                          Fm->md.ring_stride))->seq;
+            const volatile unsigned int* wd = Fm->wait_diag_h;
+            const unsigned int gave = wd != nullptr ? wd[0] : 0u, kind = wd != nullptr ? std::min(5u, (unsigned int) wd[1]) : 0u;
+            char b[400];
+            std::snprintf(b, sizeof(b),
+                          " | CUDA%d layers [%d,%d): the service thread took route %u and is %s; the next entry is "
+                          "%s; routes %llu issued, %llu served; the device gave up %u wait(s) for the host",
+                          m->dev_, m->l0_, m->l1_, done, svc[ph],
+                          posted == done + 1u ? "posted, not taken yet" : "not posted", (unsigned long long) Fm->expected,
+                          (unsigned long long) Fm->processed.load(std::memory_order_relaxed), gave);
+            line += b;
+            if (gave > 0u) {
+                std::snprintf(b, sizeof(b), " (the last: %s, wanted seq %u, saw %u)", kinds[kind], wd[2], wd[3]);
+                line += b;
+            }
+        }
+        std::fprintf(stderr, "%s - MAYA_GLM_STALL_S=0 turns this line off\n", line.c_str());
+    });
     const Glm5Geometry& g = g_;
     for (Glm5Model* m = this; m != hl->split_next_.get(); m = m->split_next_.get()) {
         if (m->spec_hop_h_[0] == nullptr) {
@@ -8196,10 +8627,13 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
     vocab_note(y);
     if (!emit(y) || produced >= max_new || q + 2 >= max_ctx_) return true;
     int d = -1;
+    stall.step("the first draft");
     if (!draft(q, y, d)) return false;
     d = ng.pick(d);   // glm-dsa B14.13
     // the head: position q+1 with the confirmed token, then q+2 with the draft (states saved first)
+    stall.phase("the head's first position");
     if (!spec_head(q + 1, y, err)) return false;
+    stall.phase("the tail's first position");
     if (!B->spec_tail(hl, q + 1, err)) return false;
     cudaSetDevice(dev_);
     if (!kda_all(false)) {
@@ -8207,6 +8641,7 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
         return false;
     }
     if (cancel) fast_->spec_cancellable = true;   // q+2 with the draft: speculative
+    stall.phase("the head's speculative position");
     if (!spec_head(q + 2, d, err)) return false;
     bool ok = true;
     // glm-dsa B11.2 (speed): MAYA_GLM_SPEC_DRAFT_EARLY=1 takes the NextN draft off the tail's critical path - the
@@ -8247,6 +8682,7 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
         // (1) the tail's token for position q+1 -> y (the truth for position q+2)
         int y2 = -1;
         lap(5);
+        stall.step("the tail's token");
         if (!take(y2)) { ok = false; break; }
         lapn(0, early ? 2 : 1);
         ++produced;
@@ -8267,10 +8703,12 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
                 *(volatile int*) fast_->spec_live_h = 0;
                 std::atomic_thread_fence(std::memory_order_seq_cst);
                 kda_all(true);
+                stall.phase("the head's redo");
                 if (!spec_head(q + 2, y2, err)) { ok = false; break; }
                 lap(2);
             }
             // (2) the draft for q+3 from (h_{q+1}, y2), made and waited for
+            stall.phase("the draft");
             if (!draft(q + 1, y2, d2)) { ok = false; break; }
             d2 = draft_ok(ng.pick(d2), y2);   // glm-dsa B14.13 (off: the NextN draft, untouched)
             lap(1);
@@ -8280,10 +8718,12 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
                 ++spec_hits_;
             } else if (!cancel) {
                 kda_all(true);
+                stall.phase("the head's redo");
                 if (!spec_head(q + 2, y2, err)) { ok = false; break; }
             }
             lap(2);
             // (4) the tail's next position goes in first (it waits for the head's hop on the device)
+            stall.phase("the tail's next position");
             if (!B->spec_tail(hl, q + 2, err)) { ok = false; break; }
             lap(3);
             kda_all(false);
@@ -8302,6 +8742,7 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
                 } else {
                     kda_all(true);
                 }
+                stall.phase("the head's redo");
                 if (!spec_head(q + 2, y2, err)) { ok = false; break; }
                 lap(2);
             }
@@ -8313,6 +8754,7 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
             if (!TL->fast_mtp(dp, y2, err)) { ok = false; break; }
             // (4) the tail's next position goes in first: it waits for the head's hop on the device and starts its
             //     layers while the host waits for the draft (and the head group's next enqueue)
+            stall.phase("the tail's next position");
             if (!B->spec_tail(hl, q + 2, err)) { ok = false; break; }
             lap(3);
             kda_all(false);
@@ -8329,6 +8771,7 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
         }
         // (5) the head's next speculative position (its boundary waits for the head's current one)
         cudaSetDevice(dev_);
+        stall.phase("the head's next position");
         if (!spec_head(q + 3, d2, err)) { ok = false; break; }
         lap(4);
         ++np;
@@ -8336,6 +8779,7 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
         ++q;
         d = d2;
     }
+    stall.phase("the drain");
     // drain: both devices idle; the head may stand one or two positions past the tail - a request after this one
     // restores its snapshot or resets, so nothing else reads that state
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
@@ -8669,6 +9113,7 @@ bool Glm5Model::ckpt_restore(int slot, std::string& err) {
 // per half the KDA snapshot and the DSA runs in that order.
 namespace {
 constexpr uint64_t kSlotMagic = 0x3254534C4159414Dull;   // "MAYALST2" (v2: the ik / ig ring's open pool only)
+constexpr int64_t kSlotChunk = (int64_t) 16 << 20;   // floats: slot_save / slot_load copy a run this much at a time
 
 // (start, floats) of each DSA cache run a slot of n positions holds on one half, in file order: in the state arena, or a
 // KV-streamed layer's latents in its host copy (kv_host[il])
@@ -8702,6 +9147,33 @@ std::vector<std::pair<float*, int64_t>> slot_dsa_runs(const GlmStateLayout& lay,
 }
 }  // namespace
 
+// AMD: slot_save's and slot_load's bounce (kSlotChunk floats), pinned once and kept.  They copied through a 64 MiB
+// vector made for each call instead; on ROCm (7.2.3, gfx1201) the copy leaves part of that pageable memory registered
+// with the driver (an SVM range), so freeing the vector unmaps a range amdgpu still tracks and it stops every GPU queue
+// of the process (kgd2kfd_quiesce_mm) - at every conversation switch, whatever the THP settings.  On gfx1201 such a
+// stop sometimes hangs the MES and the host (ROCm/TheRock #9299, #9861).  nullptr (CUDA builds, or the allocation
+// failed): the vector, as before.
+float* Glm5Model::slot_bounce() {
+#if defined(STRATA_USE_HIP)
+    if (slot_bounce_ == nullptr && !slot_bounce_tried_) {
+        slot_bounce_tried_ = true;
+        if (cudaHostAlloc((void**) &slot_bounce_, (size_t) kSlotChunk * sizeof(float), cudaHostAllocPortable) !=
+            cudaSuccess) {
+            (void) cudaGetLastError();
+            slot_bounce_ = nullptr;
+            std::fprintf(stderr, "glm slots: the pinned bounce (%lld MB) did not allocate - slots copy through pageable "
+                                 "memory, as before\n", (long long) (kSlotChunk * (int64_t) sizeof(float) >> 20));
+        } else {
+            std::fprintf(stderr, "glm slots: pinned bounce %lld MB (AMD: conversation switches free no registered "
+                                 "memory)\n", (long long) (kSlotChunk * (int64_t) sizeof(float) >> 20));
+        }
+    }
+    return slot_bounce_;
+#else
+    return nullptr;
+#endif
+}
+
 uint64_t Glm5Model::slot_save(const std::string& path, std::string& err) {
     std::vector<Glm5Model*> halves;
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
@@ -8728,6 +9200,7 @@ uint64_t Glm5Model::slot_save(const std::string& path, std::string& err) {
     put(&nh, 4);
     put(&n, 8);
     std::vector<float> buf;
+    float* const bounce = slot_bounce();   // AMD: pinned once (nullptr: buf, as before)
     double t_sync = 0, t_copy = 0, t_write = 0;
     for (Glm5Model* m : halves) {
         const Glm5Geometry& g = m->g_;
@@ -8751,13 +9224,14 @@ uint64_t Glm5Model::slot_save(const std::string& path, std::string& err) {
         if (pool_rows > 0) src.push_back({m->snap_pool_, pool_rows});
         for (const auto& r : runs) src.push_back({r.first, r.second});
         for (const auto& s : src) {
-            constexpr int64_t kChunk = (int64_t) 16 << 20;   // floats
+            constexpr int64_t kChunk = kSlotChunk;   // floats
             for (int64_t at = 0; at < s.second; at += kChunk) {
                 const int64_t c = std::min(kChunk, s.second - at);
-                buf.resize((size_t) c);
+                if (bounce == nullptr) buf.resize((size_t) c);
+                float* const bp = bounce != nullptr ? bounce : buf.data();
                 tq = std::chrono::steady_clock::now();
                 // (Default: a streamed layer's latents are pinned host memory)
-                if (cudaMemcpy(buf.data(), s.first + at, (size_t) c * sizeof(float), cudaMemcpyDefault) !=
+                if (cudaMemcpy(bp, s.first + at, (size_t) c * sizeof(float), cudaMemcpyDefault) !=
                     cudaSuccess) {
                     cudaGetLastError();
                     cudaSetDevice(dev_);
@@ -8766,7 +9240,7 @@ uint64_t Glm5Model::slot_save(const std::string& path, std::string& err) {
                 }
                 const auto tw = std::chrono::steady_clock::now();
                 t_copy += std::chrono::duration<double, std::milli>(tw - tq).count();
-                put(buf.data(), (size_t) c * sizeof(float));
+                put(bp, (size_t) c * sizeof(float));
                 t_write += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw).count();
             }
         }
@@ -8807,6 +9281,7 @@ bool Glm5Model::slot_load(const std::string& path, int64_t n_pos, std::string& e
         return false;
     }
     std::vector<float> buf;
+    float* const bounce = slot_bounce();   // AMD: pinned once (nullptr: buf, as before)
     for (Glm5Model* m : halves) {
         if (m->fast_ == nullptr) {
             err = "no fast path";
@@ -8858,12 +9333,13 @@ bool Glm5Model::slot_load(const std::string& path, int64_t n_pos, std::string& e
         }
         for (const auto& r : runs) dst.push_back({r.first, r.second});
         for (const auto& d : dst) {
-            constexpr int64_t kChunk = (int64_t) 16 << 20;
+            constexpr int64_t kChunk = kSlotChunk;
             for (int64_t at = 0; at < d.second; at += kChunk) {
                 const int64_t c = std::min(kChunk, d.second - at);
-                buf.resize((size_t) c);
-                if (!get(buf.data(), (size_t) c * sizeof(float)) ||
-                    cudaMemcpy(d.first + at, buf.data(), (size_t) c * sizeof(float), cudaMemcpyDefault) !=
+                if (bounce == nullptr) buf.resize((size_t) c);
+                float* const bp = bounce != nullptr ? bounce : buf.data();
+                if (!get(bp, (size_t) c * sizeof(float)) ||
+                    cudaMemcpy(d.first + at, bp, (size_t) c * sizeof(float), cudaMemcpyDefault) !=
                         cudaSuccess) {
                     cudaGetLastError();
                     cudaSetDevice(dev_);
