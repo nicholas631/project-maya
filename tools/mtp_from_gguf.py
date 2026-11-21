@@ -1,4 +1,5 @@
 """tools/mtp_from_gguf.py - the MTP draft layer's runtime files (what tools/mtp_rt.py writes) straight from a qwen4exp
+revision: 0.1.1
 GGUF that ships its NextN block (nextn_predict_layers 1: CYBER-FROST-3.8-PS's blk.48), so drafting needs no second
 download.
 
@@ -74,6 +75,8 @@ def main() -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--eh-order", choices=("emb-first", "hidden-first"), default="emb-first")
     ap.add_argument("--input-norms-plus-one", action="store_true")
+    ap.add_argument("--reuse-experts", action="store_true",
+                    help="keep an experts.bin already written in --out (the dense table is still rebuilt)")
     a = ap.parse_args()
     t0 = time.time()
     r = gguf.GGUFReader(a.gguf)
@@ -86,27 +89,39 @@ def main() -> int:
     b = blocks - nextn
     tens = {t.name: t for t in r.tensors}
 
+    # Unsloth's separate MTP head stores the final mixer as root output_hc_* tensors, not blk.N.nextn.hc_head_*.
+    aliases = {
+        "nextn.hc_head_norm.weight": "output_hc_norm.weight",
+        "nextn.hc_head_down.weight": "output_hc_down.weight",
+        "nextn.hc_head_up.weight": "output_hc_up.weight",
+    }
+
     def f32(name: str) -> np.ndarray:
-        t = tens[f"blk.{b}.{name}"]
+        t = tens.get(f"blk.{b}.{name}")
+        if t is None:
+            t = tens[aliases[name]]
         return np.asarray(dequantize(np.asarray(t.data), t.tensor_type), dtype=np.float32).reshape(
             [int(x) for x in reversed(t.shape)])
 
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     # ---- the experts: per expert, so the whole block never sits in RAM as float32
-    gate_t, up_t, down_t = (tens[f"blk.{b}.ffn_{k}_exps.weight"] for k in ("gate", "up", "down"))
-    raw = [np.asarray(t.data) for t in (gate_t, up_t, down_t)]
-    with open(out / "experts.bin.tmp", "wb") as f:
-        for e in range(NE):
-            g = dequantize(raw[0][e], gate_t.tensor_type).reshape(FF, H)
-            u = dequantize(raw[1][e], up_t.tensor_type).reshape(FF, H)
-            d = dequantize(raw[2][e], down_t.tensor_type).reshape(H, FF)
-            gu = q2_0(np.concatenate([g, u], axis=0)).reshape(2 * FF, H // 64 * 18)
-            dn = q2_0(d).reshape(H, FF // 64 * 18)
-            f.write(blob_of(gu, dn))
-            if (e + 1) % 128 == 0:
-                print(f"  experts {e + 1}/{NE} ({time.time() - t0:.0f} s)", flush=True)
-    (out / "experts.bin.tmp").replace(out / "experts.bin")
+    if a.reuse_experts and (out / "experts.bin").is_file():
+        print(f"reusing {(out / 'experts.bin').stat().st_size} B of experts.bin", flush=True)
+    else:
+        gate_t, up_t, down_t = (tens[f"blk.{b}.ffn_{k}_exps.weight"] for k in ("gate", "up", "down"))
+        raw = [np.asarray(t.data) for t in (gate_t, up_t, down_t)]
+        with open(out / "experts.bin.tmp", "wb") as f:
+            for e in range(NE):
+                g = dequantize(raw[0][e], gate_t.tensor_type).reshape(FF, H)
+                u = dequantize(raw[1][e], up_t.tensor_type).reshape(FF, H)
+                d = dequantize(raw[2][e], down_t.tensor_type).reshape(H, FF)
+                gu = q2_0(np.concatenate([g, u], axis=0)).reshape(2 * FF, H // 64 * 18)
+                dn = q2_0(d).reshape(H, FF // 64 * 18)
+                f.write(blob_of(gu, dn))
+                if (e + 1) % 128 == 0:
+                    print(f"  experts {e + 1}/{NE} ({time.time() - t0:.0f} s)", flush=True)
+        (out / "experts.bin.tmp").replace(out / "experts.bin")
     # ---- the rest, by the drafter's names
     eh = f32("nextn.eh_proj.weight")                     # (H, 2H): rows out, columns in
     emb, hid = (eh[:, :H], eh[:, H:]) if a.eh_order == "emb-first" else (eh[:, H:], eh[:, :H])

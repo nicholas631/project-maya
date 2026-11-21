@@ -961,7 +961,9 @@ __global__ void mx_wait_kernel(const unsigned* p, unsigned v) {
     pdl_wait();
     if (threadIdx.x != 0) return;
     while (*(volatile const unsigned*) p != v) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+        __nanosleep(64);
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
         __nanosleep(200);
 #endif
     }
@@ -1707,19 +1709,70 @@ void mv_launch(int f, const BfJobs& J, int nj, int max_n, bool vec, cudaStream_t
     } else if (f == 2) {   // (vec here: every row 4-byte aligned, so staged)
         // DS4_Q8MV_TC=1: the tensor-core kernel for 3..16 columns (2: also 2), the same bits; 32 rows a CTA in
         // 16-block chunks when that still gives 128+ CTAs, else 16 a CTA in 32-block chunks - the microbench's best
-        // (MAYA_DS4_Q8MV_TC, else DS4_Q8MV_TC; compute capability 8.0+, CUDA - q8_tc_dev)
+        // (MAYA_DS4_Q8MV_TC, read as STRATA_DS4_Q8MV_TC, else DS4_Q8MV_TC / MM3_Q8MV_TC; compute capability 8.0+, CUDA - q8_tc_dev)
         static const int tc = [] {
             const char* v = std::getenv("MAYA_DS4_Q8MV_TC");
             if (v == nullptr) v = std::getenv("DS4_Q8MV_TC");
+            if (v == nullptr) v = std::getenv("MAYA_MM3_Q8MV_TC");
+            if (v == nullptr) v = std::getenv("STRATA_MM3_Q8MV_TC");
+            if (v == nullptr) v = std::getenv("MM3_Q8MV_TC");
             return v != nullptr ? std::atoi(v) : 0;
         }();
+        static const int tc_stg = [] {
+            const char* v = std::getenv("MAYA_DS4_TC_STAGES");
+            if (v == nullptr) v = std::getenv("DS4_Q8MV_TC_STAGES");
+            if (v == nullptr) v = std::getenv("MAYA_MM3_Q8MV_TC_STAGES");
+            if (v == nullptr) v = std::getenv("STRATA_MM3_Q8MV_TC_STAGES");
+            if (v == nullptr) v = std::getenv("MM3_Q8MV_TC_STAGES");
+            return v != nullptr ? std::atoi(v) : 3;
+        }();
+        static const int tc_mt = [] {
+            const char* v = std::getenv("DS4_TC_MT");
+            if (v == nullptr) v = std::getenv("MAYA_DS4_TC_MT");
+            return v != nullptr ? std::atoi(v) : 2;
+        }();
+#if !defined(STRATA_USE_HIP)
+        static const bool tc_init [[maybe_unused]] = [] {
+            constexpr int s2_16 = q8_tc_smem<2, 3, 16>();
+            constexpr int s1_16 = q8_tc_smem<1, 3, 16>();
+            constexpr int s1_32 = q8_tc_smem<1, 3, 32>();
+            cudaFuncSetAttribute(q8_mv_tc_kernel<1, 2, 3, 16>, cudaFuncAttributeMaxDynamicSharedMemorySize, s2_16);
+            cudaFuncSetAttribute(q8_mv_tc_kernel<2, 2, 3, 16>, cudaFuncAttributeMaxDynamicSharedMemorySize, s2_16);
+            cudaFuncSetAttribute(q8_mv_tc_kernel<4, 2, 3, 16>, cudaFuncAttributeMaxDynamicSharedMemorySize, s2_16);
+            cudaFuncSetAttribute(q8_mv_tc_kernel<8, 2, 3, 16>, cudaFuncAttributeMaxDynamicSharedMemorySize, s2_16);
+            cudaFuncSetAttribute(q8_mv_tc_kernel<16, 2, 3, 16>, cudaFuncAttributeMaxDynamicSharedMemorySize, s2_16);
+            cudaFuncSetAttribute(q8_mv_tc_kernel<1, 1, 3, 16>, cudaFuncAttributeMaxDynamicSharedMemorySize, s1_16);
+            cudaFuncSetAttribute(q8_mv_tc_kernel<2, 1, 3, 16>, cudaFuncAttributeMaxDynamicSharedMemorySize, s1_16);
+            cudaFuncSetAttribute(q8_mv_tc_kernel<4, 1, 3, 16>, cudaFuncAttributeMaxDynamicSharedMemorySize, s1_16);
+            cudaFuncSetAttribute(q8_mv_tc_kernel<8, 1, 3, 16>, cudaFuncAttributeMaxDynamicSharedMemorySize, s1_16);
+            cudaFuncSetAttribute(q8_mv_tc_kernel<16, 1, 3, 16>, cudaFuncAttributeMaxDynamicSharedMemorySize, s1_16);
+            cudaFuncSetAttribute(q8_mv_tc_kernel<1, 1, 3, 32>, cudaFuncAttributeMaxDynamicSharedMemorySize, s1_32);
+            cudaFuncSetAttribute(q8_mv_tc_kernel<2, 1, 3, 32>, cudaFuncAttributeMaxDynamicSharedMemorySize, s1_32);
+            cudaFuncSetAttribute(q8_mv_tc_kernel<4, 1, 3, 32>, cudaFuncAttributeMaxDynamicSharedMemorySize, s1_32);
+            cudaFuncSetAttribute(q8_mv_tc_kernel<8, 1, 3, 32>, cudaFuncAttributeMaxDynamicSharedMemorySize, s1_32);
+            cudaFuncSetAttribute(q8_mv_tc_kernel<16, 1, 3, 32>, cudaFuncAttributeMaxDynamicSharedMemorySize, s1_32);
+            return true;
+        }();
+#endif
         if (vec && tc > 0 && (NC >= 4 || (tc >= 2 && NC == 2)) && q8_tc_ok(J, nj) && q8_tc_dev()) {
-            if ((max_n + 31) / 32 * nj >= 128)
-                pdl_launch(q8_mv_tc_kernel<NC, 2, 2, 16>, dim3((unsigned) ((max_n + 31) / 32), (unsigned) nj), 256,
-                           (size_t) q8_tc_smem<2, 2, 16>(), s, J);
-            else
-                pdl_launch(q8_mv_tc_kernel<NC, 1, 2, 32>, dim3((unsigned) ((max_n + 15) / 16), (unsigned) nj), 256,
-                           (size_t) q8_tc_smem<1, 2, 32>(), s, J);
+            if (tc_stg == 3) {
+                if (tc_mt == 1)
+                    pdl_launch(q8_mv_tc_kernel<NC, 1, 3, 16>, dim3((unsigned) ((max_n + 15) / 16), (unsigned) nj), 256,
+                               (size_t) q8_tc_smem<1, 3, 16>(), s, J);
+                else if ((max_n + 31) / 32 * nj >= 128)
+                    pdl_launch(q8_mv_tc_kernel<NC, 2, 3, 16>, dim3((unsigned) ((max_n + 31) / 32), (unsigned) nj), 256,
+                               (size_t) q8_tc_smem<2, 3, 16>(), s, J);
+                else
+                    pdl_launch(q8_mv_tc_kernel<NC, 1, 3, 32>, dim3((unsigned) ((max_n + 15) / 16), (unsigned) nj), 256,
+                               (size_t) q8_tc_smem<1, 3, 32>(), s, J);
+            } else {
+                if ((max_n + 31) / 32 * nj >= 128)
+                    pdl_launch(q8_mv_tc_kernel<NC, 2, 2, 16>, dim3((unsigned) ((max_n + 31) / 32), (unsigned) nj), 256,
+                               (size_t) q8_tc_smem<2, 2, 16>(), s, J);
+                else
+                    pdl_launch(q8_mv_tc_kernel<NC, 1, 2, 32>, dim3((unsigned) ((max_n + 15) / 16), (unsigned) nj), 256,
+                               (size_t) q8_tc_smem<1, 2, 32>(), s, J);
+            }
         } else if (vec) pdl_launch(q8_mv_kernel<NC, true>, grid, kThreads, 0, s, J);
         else pdl_launch(q8_mv_kernel<NC, false>, grid, kThreads, 0, s, J);
     } else {

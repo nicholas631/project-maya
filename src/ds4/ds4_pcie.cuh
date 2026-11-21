@@ -53,8 +53,32 @@ __device__ __forceinline__ unsigned long long pull_clock() {
 }
 
 __device__ __forceinline__ void pull_nap() {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    __nanosleep(64);
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
     __nanosleep(500);
+#endif
+}
+
+__device__ __forceinline__ uint4 pull_ld_u4(const uint4* p) {
+#if !defined(STRATA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    uint4 v;
+    asm volatile("ld.global.cg.v4.u32 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+                 : "l"(p));
+    return v;
+#else
+    return *p;
+#endif
+}
+
+__device__ __forceinline__ void pull_st_u4(uint4* p, uint4 v) {
+#if !defined(STRATA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("st.global.cs.v4.u32 [%0], {%1, %2, %3, %4};"
+                 :: "l"(p), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w)
+                 : "memory");
+#else
+    *p = v;
 #endif
 }
 
@@ -113,8 +137,20 @@ __global__ void __launch_bounds__(256) stream_fetch_kernel(Pull* p, unsigned seq
             const uint4* src = (const uint4*) (s_mat[i][r] != 0ull ? s_mat[i][r] : s_src[i] + m.off[r]);
             uint4* dst = (uint4*) (s_dst[i] + m.off[r]);
             const size_t n16 = (m.bytes[r] + 15) / 16;
-            for (size_t j = (size_t) blockIdx.x * blockDim.x + tid; j < n16; j += (size_t) gridDim.x * blockDim.x)
-                dst[j] = src[j];
+            size_t j = (size_t) blockIdx.x * blockDim.x + tid;
+            const size_t stride = (size_t) gridDim.x * blockDim.x;
+            for (; j + 3 * stride < n16; j += 4 * stride) {
+                uint4 v0 = pull_ld_u4(&src[j]);
+                uint4 v1 = pull_ld_u4(&src[j + stride]);
+                uint4 v2 = pull_ld_u4(&src[j + 2 * stride]);
+                uint4 v3 = pull_ld_u4(&src[j + 3 * stride]);
+                pull_st_u4(&dst[j], v0);
+                pull_st_u4(&dst[j + stride], v1);
+                pull_st_u4(&dst[j + 2 * stride], v2);
+                pull_st_u4(&dst[j + 3 * stride], v3);
+            }
+            for (; j < n16; j += stride)
+                pull_st_u4(&dst[j], pull_ld_u4(&src[j]));
         }
     }
     __syncthreads();

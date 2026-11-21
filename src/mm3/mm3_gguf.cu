@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 
 namespace mm3::gg {
@@ -200,7 +201,9 @@ __global__ void wait_kernel(const unsigned* p, unsigned v, unsigned long long li
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));   // (ns)
 #endif
     while (*(volatile const unsigned*) p != v) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+        __nanosleep(64);
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
         __nanosleep(200);
 #endif
 #if defined(STRATA_USE_HIP)
@@ -552,6 +555,11 @@ iq::SetArgs set_args(const x3::SetArgs& sa, const iq::Args& ia) {
     q.graw = sa.graw;
     return q;
 }
+#if defined(STRATA_USE_HIP)
+void bind_mmq_rows(std::optional<iq::MmqRowsScope>& scope, const x3::SetArgs& sa) {
+    if (sa.hbounds != nullptr && sa.n_exp > 0) scope.emplace(sa.hbounds[sa.n_exp] - sa.row0, sa.hbounds);
+}
+#endif
 }  // namespace
 
 void set_gate_up(const x3::SetArgs& sa, const float* x, int ldx, const int* row_idx, uint16_t* h16, int ldh,
@@ -565,6 +573,10 @@ void set_gate_up(const x3::SetArgs& sa, const float* x, int ldx, const int* row_
         fail("set_gate_up: gate and up of different types need the graw scratch");
         return;
     }
+#if defined(STRATA_USE_HIP)
+    std::optional<iq::MmqRowsScope> mmq_scope;
+    bind_mmq_rows(mmq_scope, sa);
+#endif
     iq::SetArgs q = set_args(sa, ia);
     q.xf = x;
     q.xh = sa.x16;   // (the tensor-core tiles' FP16 rows; the light kernels keep xf)
@@ -582,6 +594,10 @@ void set_down(const x3::SetArgs& sa, const uint16_t* h16, int ldh, float* y, int
     if (!geometry("set_down", 1, sa.n_embd, sa.n_ff) || sa.wbase == nullptr ||
         !iq_args(sa.lay, sa.n_embd, sa.n_ff, sa.limit, ia, "set_down"))
         return;
+#if defined(STRATA_USE_HIP)
+    std::optional<iq::MmqRowsScope> mmq_scope;
+    bind_mmq_rows(mmq_scope, sa);
+#endif
     iq::SetArgs q = set_args(sa, ia);
     q.xh = h16;
     q.ldx = ldh;

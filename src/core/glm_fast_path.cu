@@ -439,7 +439,9 @@ static int cpu_node_now() {
 #endif
 }
 
-static void* numa_pinned(size_t bytes, const RowLayout* rl = nullptr) {
+int glmfast::prefill_row_node() { return cpu_node_now(); }
+
+static void* numa_pinned(size_t bytes, const RowLayout* rl, glmfast::RowHalvesPlacement& placement) {
 #ifdef __linux__
     const char* v = getenv("MAYA_GLM_NUMA");
     const auto nodes = numa_nodes();
@@ -482,6 +484,7 @@ static void* numa_pinned(size_t bytes, const RowLayout* rl = nullptr) {
                     munmap(p, bytes);
                     return nullptr;
                 }
+                placement = {rl->gu, rl->doff, rl->blob, n0, n1};
                 const int i = g_rh_n.load();
                 if (i < 32) {
                     g_rh[i] = {(const uint8_t*) p, (const uint8_t*) p + bytes, *rl, n0, n1};
@@ -541,6 +544,8 @@ static void* numa_pinned(size_t bytes, const RowLayout* rl = nullptr) {
     return p;
 #else
     (void) bytes;
+    (void) rl;
+    (void) placement;
     return nullptr;
 #endif
 }
@@ -2186,7 +2191,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                     err = "glm helper link: the shared RAM tier did not allocate or register";
                     return false;
                 }
-                if ((p = numa_pinned((size_t) n * R.stride, rl.gu > 0 ? &rl : nullptr)) != nullptr) {   // (over every socket: numa_pinned)
+                if ((p = numa_pinned((size_t) n * R.stride, rl.gu > 0 ? &rl : nullptr, R.row_halves)) != nullptr) {   // (over every socket: numa_pinned)
                     R.registered = true;
                     R.per_part = 0;   // (one mapping)
                     break;
@@ -3740,7 +3745,8 @@ static std::shared_ptr<glmfast::Workers> shared_cpu_pool(int threads) {
     std::lock_guard<std::mutex> lk(mu);
     std::shared_ptr<glmfast::Workers> p = held.lock();
     if (p == nullptr || p->size() != threads) {
-        const std::vector<int> cpus = cpu_list_env("MAYA_GLM_POOL_CPUS");
+        std::vector<int> cpus = cpu_list_env("MAYA_GLM_POOL_CPUS");
+        if (cpus.empty()) cpus = cpu_list_env("GLM_POOL_CPUS");
         p = std::make_shared<glmfast::Workers>(threads - 1, 20000, cpus, concurrent, !cpus.empty());
         held = p;
     }
@@ -4009,6 +4015,10 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     if (glmtier::lane_pools(*F, g, n_parts_, part_, own_count, lv != nullptr, threads, gpu_numa_node(dev_), dev_)) {
         // glm-dsa B8.3 / B8.4: a pinned pool per socket (MAYA_GLM_CPU_SHARED=socket) or the node-split pools
     } else if (shared) {
+        // Only this explicit global shared pool may exceed the old manual limit.
+        // Per-device, socket and node-split pools above keep their existing sizing.
+        if (lv != nullptr)
+            threads = glmaff::manual_shared_threads(std::atoi(lv), glmaff::mask_cpus_raw());
         F->cpu_pool = shared_cpu_pool(threads);
     } else {
         // MAYA_GLM_CPU_LANE_MAX=N, more than the lane's count: the pool holds N threads and starts with the lane's
@@ -5648,6 +5658,33 @@ void Glm5Model::fast_service() {
                             rs = s2;
                             break;
                         }
+                    // MAYA_GLM_ADMIT=all (libosmos's membrane: every miss admitted): no free slot - the least recently
+                    // used held expert of a layer this token has passed gives up its slot.  Nothing reads those layers
+                    // again before the boundary (a device walks its layers in order, a verify window's tokens
+                    // together), so its bytes can be overwritten now; the boundary clears its table entry.  Without
+                    // it the read lands in staging and is gone after this route: on Maya-XS over 2x RTX 5090 with a
+                    // 60 GB RAM tier the replayed routes read ~30% more from the disk that way
+                    static const bool admit_all = [] {
+                        const char* v = getenv("MAYA_GLM_ADMIT");
+                        return v != nullptr && std::strcmp(v, "all") == 0;
+                    }();
+                    if (rs < 0 && admit_all) {
+                        uint64_t bt = UINT64_MAX;
+                        for (int s2 = 0; s2 < R.n; ++s2) {
+                            if (R.st[(size_t) s2] != FastState::kRHold) continue;
+                            const int ok2 = R.key[(size_t) s2];
+                            if (ok2 < 0 || ok2 / g.n_expert >= il || R.tick[(size_t) s2] >= bt) continue;
+                            bt = R.tick[(size_t) s2];
+                            rs = s2;
+                        }
+                        if (rs >= 0) {
+                            const int old = R.key[(size_t) rs];
+                            if (F->ram_of[(size_t) old] == rs) F->ram_of[(size_t) old] = -1;
+                            F->left[(size_t) old] = 2;
+                            F->admit_cleared.push_back(old);
+                            ++F->admit_evict;
+                        }
+                    }
                     if (rs >= 0) {
                         R.key[(size_t) rs] = key;
                         R.tick[(size_t) rs] = F->clock;
@@ -6144,6 +6181,10 @@ bool Glm5Model::fast_boundary(std::string& err) {
         F->upd_val_h[nu] = v;
         ++nu;
     };
+    // (0) the experts MAYA_GLM_ADMIT=all evicted during the token: out of the RAM table (unless read back since)
+    for (const int k : F->admit_cleared)
+        if (F->ram_of[(size_t) k] < 0) upd(F->rtab_key(k), 0ull);
+    F->admit_cleared.clear();
     // the RAM tier's victim among its held experts: the least-used by the aged counts among those no route used in the
     // last `protect` routes (~64 tokens) - a newly hot expert keeps its place while its count catches up, instead of
     // going back to disk as the lowest count and being read again a moment later (real chats measured 7-11 disk reads
@@ -6179,6 +6220,16 @@ bool Glm5Model::fast_boundary(std::string& err) {
         }
         return best >= 0 ? best : oldest;
     };
+    // STRATA_GLM_DEMOTE=all: every VRAM victim drops into the RAM tier (its victim by the RAM policy), not only one
+    // whose count beats the RAM tier's least-used.  The routes are recency-heavy - an expert just evicted from VRAM is
+    // often the next one back - and a dropped one is read from disk again.  It matters where experts spill to disk and
+    // the RAM tier outweighs the VRAM pool: GLM-5.3-Flash UD-IQ3_XXS, 2x RTX 5090, 8 GB pools + 50 GB RAM tier,
+    // decode 16.1 -> 18.7 tok/s (disk 0.305 -> 0.236 GB a token), 19.2 with RAM_EVICT=lru; with a 20 GB RAM tier
+    // (VRAM-heavy) unchanged
+    static const bool demote_all = [] {
+        const char* v = getenv("STRATA_GLM_DEMOTE");
+        return v != nullptr && std::strcmp(v, "all") == 0;
+    }();
     static const bool tier_gc = [] {
         const char* v = getenv("MAYA_GLM_TIER_GC");
         return v == nullptr || std::atoi(v) != 0;
@@ -6341,7 +6392,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
                 rs = ram_victim(R);
                 if (rs >= 0) rc_min = F->cnt[(size_t) R.key[(size_t) rs]];
             }
-            if (rs >= 0 && (R.st[(size_t) rs] == FastState::kRFree || rc_min < bc)) {
+            if (rs >= 0 && (R.st[(size_t) rs] == FastState::kRFree || demote_all || rc_min < bc)) {
                 if (R.st[(size_t) rs] == FastState::kRHold) {
                     const int old = R.key[(size_t) rs];
                     F->left[(size_t) old] = 2;

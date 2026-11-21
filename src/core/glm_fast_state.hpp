@@ -9,6 +9,7 @@
 #include "strata/kernels/glm_kv_stream.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "glm_memory.hpp"
+#include "glm_prefill_row_local.hpp"
 #include "glm_layer_graphs.hpp"
 
 #include "ggml.h"
@@ -715,6 +716,7 @@ struct Glm5Model::FastState {
         uint8_t* base = nullptr;   // the first piece (the only one unless per_part > 0)
         int n = 0;
         bool registered = false;   // numa_pinned's (mmap + cudaHostRegister), not cudaHostAlloc's
+        glmfast::RowHalvesPlacement row_halves;
         // pinned in pieces of per_part slots (Windows: a big block takes far more of the per-process pinning budget
         // than its size - a 2-GPU split's second part got 0 GB, #417); 0: one block from base
         int per_part = 0;
@@ -749,6 +751,11 @@ struct Glm5Model::FastState {
     uint64_t diag_resident_skip = 0;   // RAM-resident mode: spare refills skipped (no free RAM slot, no drop)
     std::atomic<uint64_t> ring_laps{0};   // B2.5: times the service thread found the device a whole ring ahead
     uint64_t diag_dup = 0, diag_adopt = 0;   // the boundary's clean-up: duplicate RAM copies freed, lost ones adopted
+    // MAYA_GLM_ADMIT=all: a decode's disk read with no free RAM slot takes the least recently used RAM expert's slot of
+    // a layer this token has passed (the route service thread's), and the boundary forgets the evicted experts' table
+    // entries; admit_evict counts them. Kept from phase-a-glm-tier: glm_fast_path.cu still pushes and clears them.
+    std::vector<int> admit_cleared;
+    uint64_t admit_evict = 0;
     // MAYA_GLM_TIER_VERIFY=1 (debug, off by default; fast_boundary): after every boundary the device's own tables are
     // read back and checked against the host's - a RAM entry that points at a slot which no longer holds the expert
     // ("stale": the next expert written there would be computed under this one's name), an expert resident in two

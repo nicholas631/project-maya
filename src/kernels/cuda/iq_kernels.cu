@@ -1,4 +1,5 @@
 // src/kernels/cuda/iq_kernels.cu - see include/strata/kernels/iq_kernels.hpp.
+// revision: 0.1.5 — Q8_0 grouped down matvec; HIP fp-contract off on the Q8_0 dot.
 //
 // The dot products (vec_dot_*_q8_1), the dequantizers and the q8_1 quantizer are transcribed from llama.cpp
 // (ggml/src/ggml-cuda/vecdotq.cuh, dequantize.cuh, quantize.cu at the commit in third_party/ggml/VERSION.txt;
@@ -325,6 +326,23 @@ __device__ __forceinline__ float vec_dot_q5_0_q8_1(const void* __restrict__ vbq,
     return d5 * (sumi * ds8f.x - (16 * 2 / QI5_0) * ds8f.y);
 }
 
+// Q8_0: 32 int8 values + fp16 scale d; one call covers 8 values (2 x dp4a, VDR 2, 4 calls per 32-value block).
+__device__ __forceinline__ float vec_dot_q8_0_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
+                                                   const int& kbx, const int& iqs) {
+#if defined(__HIPCC__)
+#pragma clang fp contract(off)
+#endif
+    const block_q8_0* bq8_0 = (const block_q8_0*) vbq + kbx;
+    int sumi = 0;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int v = get_int_b2(bq8_0->qs, iqs + i);
+        const int u = get_int_b4(bq8_1->qs, iqs + i);
+        sumi = ggml_cuda_dp4a(v, u, sumi);
+    }
+    return __half2float(bq8_0->d) * __low2float(bq8_1->ds) * float(sumi);
+}
+
 // IQ4_XS: 256 values as 8 sub-blocks of 32 (6-bit scale each); one call covers one sub-block (iqs = 4 * sub-block),
 // and `bq8_1` is the super-block's first q8_1 block, so the call's activation is bq8_1[iqs / 4].  Strata's Qwen IQ3_S
 // file keeps one layer's routed gate/up experts in this format.
@@ -413,6 +431,8 @@ template<> struct Fmt<20> { static constexpr int qk = 32, ipb = 2, step = 2;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq4_nl_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<6> { static constexpr int qk = 32, ipb = 2, step = 2;    // Q5_0: QI5_0 4 / VDR 2
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q5_0_q8_1(v, y, kbx, iqs); } };
+template<> struct Fmt<8> { static constexpr int qk = 32, ipb = 4, step = 2;     // Q8_0: QI8_0 8 / VDR 2
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q8_0_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<21> { static constexpr int qk = 256, ipb = 8, step = 2;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq3_s_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<23> { static constexpr int qk = 256, ipb = 8, step = 4;
@@ -899,6 +919,18 @@ __device__ void dq_iq4_xs(const void* vx, int64_t ibs, dst_t* yy, int tid, const
         y[j + 16] = cvt<dst_t>(d * codebook[q4[j] >> 4]);
     }
 }
+// Q8_0 token embeddings (UD-IQ4_XS stores token_embd.weight as Q8_0). Eight blocks of 32 per
+// 256-wide superblock; each of the 32 threads writes eight values. Not added to is_iq(): the expert
+// matvec does not accept this type.
+template<typename dst_t>
+__device__ void dq_q8_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
+    const block_q8_0* x = (const block_q8_0*) vx + ibs * (QK_K / QK8_0);
+    const int ib = tid % 8, part = tid / 8;
+    dst_t* y = yy + 32 * ib + 8 * part;
+    const float d = (float) x[ib].d;
+    const int8_t* q = x[ib].qs + 8 * part;
+    for (int j = 0; j < 8; ++j) y[j] = cvt<dst_t>(d * (float) q[j]);
+}
 template<typename dst_t>
 __device__ void dq_q2_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     // one "superblock" = 256 values = 4 blocks of 64; thread tid writes 8 values
@@ -935,6 +967,7 @@ template<typename dst_t>
 __device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs, dst_t* y, int tid) {
     switch (ty) {
         case 6: dq_q5_0(vx, ibs, y, tid); break;
+        case 8: dq_q8_0(vx, ibs, y, tid); break;
         case 16: dq_iq2_xxs(vx, ibs, y, tid); break;
         case 17: dq_iq2_xs(vx, ibs, y, tid); break;
         case 18: dq_iq3_xxs(vx, ibs, y, tid); break;
@@ -1030,14 +1063,15 @@ void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n
         case 19: launch_mmvq<19>(W, rb, X, y, n_in, n_out, ncols, grid, block, s); break;
         case 42: launch_mmvq<42>(W, rb, X, y, n_in, n_out, ncols, grid, block, s); break;
         case 13: launch_mmvq<13>(W, rb, X, y, n_in, n_out, ncols, grid, block, s); break;
+        case 8: launch_mmvq<8>(W, rb, X, y, n_in, n_out, ncols, grid, block, s); break;
         default: std::fprintf(stderr, "iq_mmvq: type %d is not supported\n", t); std::exit(1);
     }
     check("iq_mmvq");
 }
 
 void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stream) {
-    // (+ Q5_0: a routed down matrix of unsloth's Qwen3.8 UD-IQ2_XS; iq_supported() stays the i-quant set)
-    if (n % 256 != 0 || !(is_iq(t) || t == 6)) { std::fprintf(stderr, "iq_dequant_f16: bad arguments\n"); std::exit(1); }
+    // (+ Q5_0/Q8_0 routed-down matrices; UD-IQ4_XS layers' Q8_0 dequantized by dq_q8_0; iq_supported() stays the i-quant set)
+    if (n % 256 != 0 || !(is_iq(t) || t == 6 || t == 8)) { std::fprintf(stderr, "iq_dequant_f16: bad arguments\n"); std::exit(1); }
     dequant_flat_kernel<__half><<<(unsigned) (n / 256), 32, 0, (cudaStream_t) stream>>>(t, src, (__half*) dst);
     check("iq_dequant_f16");
 }
@@ -1055,14 +1089,14 @@ __global__ void embed_rows_kernel(int ty, const uint8_t* __restrict__ table, siz
 void iq_embed_rows(int t, const void* table, size_t row_bytes, const int32_t* tokens, int64_t n_tok, int64_t n_embd,
                    float* out, void* stream) {
     if (n_tok <= 0) return;
-    if (n_embd % 256 != 0 || !is_iq(t)) { std::fprintf(stderr, "iq_embed_rows: bad arguments\n"); std::exit(1); }
+    if (n_embd % 256 != 0 || !(is_iq(t) || t == 8)) { std::fprintf(stderr, "iq_embed_rows: bad arguments\n"); std::exit(1); }
     embed_rows_kernel<<<dim3((unsigned) (n_embd / 256), (unsigned) n_tok), 32, 0, (cudaStream_t) stream>>>(
         t, (const uint8_t*) table, row_bytes, tokens, n_embd, out);
     check("iq_embed_rows");
 }
 
 void iq_dequant_f32(int t, const void* src, int64_t n, float* dst, void* stream) {
-    if (n % 256 != 0 || !is_iq(t)) { std::fprintf(stderr, "iq_dequant_f32: bad arguments\n"); std::exit(1); }
+    if (n % 256 != 0 || !(is_iq(t) || t == 8)) { std::fprintf(stderr, "iq_dequant_f32: bad arguments\n"); std::exit(1); }
     dequant_flat_kernel<float><<<(unsigned) (n / 256), 32, 0, (cudaStream_t) stream>>>(t, src, dst);
     check("iq_dequant_f32");
 }
@@ -1124,7 +1158,7 @@ bool native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     // glm-dsa B3.5: a type with no kernel below (the two switches' cases) is refused before any launch and reported by
     // the caller; it stopped the process (std::exit) when the K-quants were missing
     const auto has_kernel = [](int t) { return (t >= 10 && t <= 14) || (t >= 16 && t <= 23) || t == 29 || t == 42; };
-    if (!has_kernel(L.gu_type) || !(has_kernel(L.d_type) || L.d_type == 6)) {   // (down: Maya v1.1.55 Q5_0 too)
+    if (!has_kernel(L.gu_type) || !(has_kernel(L.d_type) || L.d_type == 6 || L.d_type == 8)) {   // (down: Q5_0 & Q8_0 too)
         std::fprintf(stderr, "native_expert_grouped: no kernel for gate/up type %d, down type %d\n", L.gu_type, L.d_type);
         return false;
     }
@@ -1176,6 +1210,7 @@ bool native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         case 20: native_down_kernel<20><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 23: native_down_kernel<23><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 42: native_down_kernel<42><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 8: native_down_kernel<8><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 10: native_down_kernel<10><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 11: native_down_kernel<11><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 12: native_down_kernel<12><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;

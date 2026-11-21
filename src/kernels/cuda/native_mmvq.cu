@@ -1,6 +1,7 @@
 // Adapted from llama.cpp 3cf03257f219afbe7334045ff7c6a06ac68c627d:
 // ggml/src/ggml-cuda/{quantize.cu,vecdotq.cuh,mmvq.cu,common.cuh}
 // and ggml/src/ggml-common.h. See docs/native-mmvq.md for exact scope.
+// revision: 0.1.1 — HIP fp-contract off on the Q5_K head dot (gfx1201 FMA).
 //
 // MIT License
 // Copyright (c) 2023-2026 The ggml authors
@@ -156,6 +157,9 @@ __device__ __forceinline__ float q5_q8_dot_impl(
     const int* __restrict__ vl, const int* __restrict__ vh, const int* __restrict__ u,
     const uint8_t* __restrict__ sc, const uint8_t* __restrict__ m, const half2& dm5,
     const float* __restrict__ d8) {
+#if defined(__HIPCC__)
+#pragma clang fp contract(off)
+#endif
     float sumf_d = 0.0f;
     float sumf_m = 0.0f;
 #pragma unroll

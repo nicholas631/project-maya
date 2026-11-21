@@ -458,13 +458,13 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
             uint32_t f[4];
             slice_frags<K2, cb>(wc[s], st, lane, f);
 #if defined(EXL3_TC)
-            uint32_t b0 = 0u, b1 = 0u;
+            // A: rows (outputs) g / g + 8, columns (inputs) 2t.. / 2t + 8..: steps 0,1 / 4,5 / 2,3 / 6,7
+            uint32_t b0 = 0, b1 = 0;
             if (g < nc) {
                 const __half* xr = xq + g * kCols + s * 16 + 2 * t;
                 b0 = *reinterpret_cast<const uint32_t*>(xr);
                 b1 = *reinterpret_cast<const uint32_t*>(xr + 8);
             }
-            // A: rows (outputs) g / g + 8, columns (inputs) 2t.. / 2t + 8..: steps 0,1 / 4,5 / 2,3 / 6,7
             mma_f32(c, f[0], f[2], f[1], f[3], b0, b1);
 #elif defined(EXL3_WM70)
             // f: outputs g (f[0], f[1]) and g + 8 (f[2], f[3]), inputs 2t, 2t + 1 (f[0], f[2]) / 2t + 8, 2t + 9
