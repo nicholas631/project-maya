@@ -157,6 +157,8 @@ These settings change what the engine chooses (put them in the config with `--en
 | `MAYA_GLM_SPEC_FOLLOW` | off | speed A/B (`--spec-follow PATH`): a file of token ids (as `--tokens-file` takes them) - every request decodes that continuation instead of its own picks and ends with it, and the drafting decodes (the two-GPU draft decode, the one-GPU MTP block, DFlash2) keep exactly the drafts that match it: two builds or settings then process the same text with the same windows, drafts and routes, where a near-tie flip would otherwise change the text and with it the draft acceptance and the speed. The log's `glm follow:` line counts the tokens where the model's own pick differed (a check of the numbers: a placement change flips a few near-ties). One conversation at a time (not with `MAYA_GLM_SEQS`). A text from another model, or from the same model with other settings, favours the drafts that made it: compare a change on the same model and its own text |
 | `MAYA_GLM_SPEC_FOLLOW_SAVE` | off | `--spec-follow-save PATH`: each request's decoded token ids are written to that file - the continuation `MAYA_GLM_SPEC_FOLLOW` reads |
 | `MAYA_GLM_STALL_S` | 20 | a split's drafting decode: when one step runs longer than this many seconds, a `glm stall:` line on stderr says where each GPU of the split is (the device's waits for the host that gave up, the service thread's routes and what it is doing); again every minute while it stays stuck; `0` = no line. Only a report - the answers and the speed do not change, and nothing is stopped (stopping a hung engine is `MAYA_WATCHDOG_S` and the server's `MAYA_ENGINE_STALL_S`) |
+| `MAYA_GLM_DRAIN_WAIT` | off | an expert moved from VRAM to the RAM tier at the last token is read, until its copy lands, from the VRAM slot it is leaving (the same bytes, no wait). `1` = wait for its copy and read the RAM copy, as up to v1.1.70 (A/B only: on Windows that wait stalled two-GPU drafting ~30 s a step, #860) |
+| `MAYA_GLM_WIN_SUBMIT` | on (Windows) | Windows only: the moves between VRAM and RAM queued at each token are handed to the GPU at once instead of when their copies are next checked (Windows holds queued GPU work back until the program waits on it or asks); `0` = off (A/B) |
 | `MAYA_GLM_SERVICE_IDLE_MS` | 200 | the engine's tier threads (one per GPU) spin while a decode routes experts and sleep after this long without one, so an idle engine uses ~1% of a core instead of one core per GPU; `0` = spin always |
 | `MAYA_GLM_SERVICE_DEEP_S` | 60 | after this many seconds without a request the tier threads sleep on a gate (`MAYA_GLM_SERVICE_DEEP_MS`, 100, at a time) instead of waking 500 times a second; the next request's line wakes them at once, so the first token waits for nothing. `0` = never |
 | `MAYA_GLM_SERVICE_NAP_US` | 100 (Windows: 1000) | how long the tier threads sleep between looks for work once `MAYA_GLM_SERVICE_IDLE_MS` has passed, in microseconds (1 to 10000). A larger value lowers the CPU use of an engine that is waiting; the first token after a pause can wait up to one such sleep. Not a number = the default; a value outside the range is brought to its nearest end |
@@ -237,6 +239,7 @@ These settings change what the engine chooses (put them in the config with `--en
 | `MAYA_LOOP_GUARD_COLLAPSE_MAX` | 32000 | the server: how many characters of conversation (content, reasoning and tool calls, roughly tokens x 3.5) the loop guard may still rewrite history in. Above it the prompt is left whole - a collapse changes the prompt's prefix, so the engine's snapshot and checkpoints no longer match and the whole conversation is read again (a 126K-token prompt: 16 chunks, about 2 minutes). The generation-side protections (`stops_short`, `keep_going`, the repetition penalty) still apply there. `0` = no limit, the behaviour before this setting. See #702. |
 | `MAYA_PAR_MAX` | off | the server, every model: the most conversations at once it asks of the engine - a config's `--parallel` above it starts as this many, and the requests beyond it wait in the server's queue (for a card the model already fills, where one more conversation leaves the prompt path no room). Off (or `0`): `--parallel` as the config says |
 | `MAYA_MODEL_MANAGEMENT` | on | the server: llama.cpp's model management endpoints `POST /models/load`, `POST /models/unload` and `GET /models/sse`, for API clients and commands (load the model, free its GPU memory, watch its state). They need the API key when one is set. `0` = off (as `"model_management": false` in the config); off, they answer 404 |
+| `MAYA_WEB_UI` | on | the server: Maya's web page (`/`, `/web/*`, `/fonts/*`). `0` = off (as `"web_ui": false` in the config): an API-only server - those paths answer 404 as any unknown one, while `/v1/*`, `/v1/messages`, Maya's model API and `/health` answer as before; the page's data routes (`/settings`, `/metrics`, `/mcp`, `/api/*`, `/status`) need the API key when one is set, page or no page. A setup again keeps the config's `"web_ui"` |
 | `MAYA_VIDEO_MAX_FRAMES` | 240 | the server (GLM): the most frames a video may give (read at 4 a second, so 240 = a minute); a longer video is refused before it is decoded, with its length in the message. Every frame takes an image's share of the context. Videos need ffmpeg and ffprobe installed |
 
 **The expert profile** (`data/expert-profile-glm.bin`). At start the engine fills VRAM with the experts a profile ranks
@@ -1115,6 +1118,55 @@ decode at 118K context the same (33.0 against 31.9 tok/s, 32 greedy tokens); per
 short prompts with DSpark (temperature 1) 63.7 against 69.8 tok/s - the first group's 10 layers keep ~89% of their
 experts in VRAM, the second's 27 only ~23%, and each token waits on the second's CPU lane.
 
+The split trades the two. The same PC and quant at v1.1.69 (`--tp 4`, `--parallel 2`, 512K context, DSpark; five short
+prompts of 384 tokens each, greedy / temperature 1; a fresh 32,380-token prompt read in chunks of 6400), by where the
+two groups' layers are cut - more layers on the first group even out the experts the two keep in VRAM, and leave it
+more of the layers a prompt runs in full:
+
+| `DS4_SPLIT` | experts in VRAM, first / second group | routed picks in VRAM | decode, tok/s | 32K prompt, tok/s |
+| --- | --- | --- | --- | --- |
+| `3,10,27` | 80% / 23% | 90.5% | 62.8 / 60.6 | 1,799 |
+| `3,12,25` | 66% / 27% | 92.2% | 67.6 / 63.9 | 1,702 |
+| `3,14,23` | 56% / 30% | 93.0% | 70.5 / 67.5 | 1,515 |
+| `3,16,21` | 49% / 33% | 93.5% | 71.1 / 69.6 | 1,363 |
+| `3,18,19` | 41% / 38% | 93.8% | 71.0 / 68.0 | 1,281 |
+
+A point more of the picks in VRAM is worth about 5% of the decode there. `MAYA_DS4_DSPARK_CUM=0.35` adds 3-5% to
+the greedy decode at any of these splits (more drafts verified a round); at temperature 1 it gains only together with
+`DS4_DSPARK_SAMPLE=1` (the drafts drawn from the drafter's distribution: 72% -> 82% of them kept; a round with a
+prompt-lookup proposal keeps the drafter's argmax, so the lookup works beside it as without), about 2%, and
+`--dspark-conf 0.35` then adds 2.5% more (68.3 -> 70.1 at `3,16,21`; 0.65: 67.5). `DS4_DRAFT_COST=1` measured 3%
+below the fixed 0.35 cut there, `DS4_DSPARK_QTEMP` 0.7 / 1.3 and `DS4_AR_P2P=1` within the runs' noise (about 2%).
+
+`n@g` in `DS4_SPLIT` keeps both: the next `n` layers go to group `g` whichever its turn, so the trunk's last layers
+can go back to a group that ran earlier ones. A long prompt's pace is set by the layers before its skip (0-19), and
+those stay where the prompt wants them; the layers past it run only a prompt's last rows, so they can sit where the
+decode wants them. With `3,9,22,6@1` the first group runs layers 3-11 and then 34-39 with the head, the second 12-33
+between the two. Same PC, quant and runs as the table above:
+
+| `DS4_SPLIT` | experts in VRAM, first / second group | routed picks in VRAM | decode, tok/s | 32K prompt, tok/s |
+| --- | --- | --- | --- | --- |
+| `3,10,27` | 80% / 23% | 90.5% | 62.8 / 60.6 | 1,799 |
+| `3,10,23,4@1` | 50% / 32% | 93.0% | 68.9 / 66.8 | 1,790 |
+| `3,10,22,5@1` | 45% / 34% | 93.4% | 69.6 / 67.7 | 1,766 |
+| `3,10,21,6@1` | 42% / 37% | 93.5% | 70.4 / 66.7 | 1,740 |
+| `3,9,23,5@1` | 48% / 32% | 92.9% | 70.0 / 67.1 | 1,832 |
+| `3,9,22,6@1` | 44% / 35% | 93.5% | 71.3 / 67.7 | 1,818 |
+
+The first group has the time for it: in a long prompt at `3,10,27` the RTX 3090 sets the pace (1.9 s a chunk of 6400
+tokens, three layers and 9 GB of experts streamed), and each group of four is busy ~1.5 s of it (`DS4_RUN_TRACE=1`).
+With layers back on it the first group streams more of its early layers' experts a chunk (19 -> 42 GB a member over
+the 32K prompt at `3,10,23,4@1`), the second fewer, and the prompt's last chunk - the only one that runs the layers
+past the skip - takes 4.3 s, not 5.1. The groups lend chunks of 7168 tokens there (not 6400). A fresh 129K-token
+prompt: `3,10,27` 51.1 s (2,521 tok/s), `3,9,22,6@1` 52.4 s (2,460), `3,10,22,5@1` 55.6 s (2,319) - the first
+group's nine early layers leave it the room its last ones take, ten do not quite.
+
+One group can take layers twice, and the second time they are the trunk's last ones: each device's thread still puts
+its layers on its stream in order and hands a window on once. Not the Engram layers, and not on a pool of PCs. In a
+prompt, a chunk those last layers leave out still brings them its rows of the other group's source (the skip's first
+layer); a device takes them a chunk later, after its first layers of the next chunk, so the two groups keep running
+two chunks at once. While answering, the group's expert-cache copies go in the gap between its two runs of layers.
+
 ## DeepSeek: skipping light experts the SSD would read (experimental)
 
 When DeepSeek-V4.1-Flash's experts do not fit in VRAM and RAM, a token waits for the SSD to read the experts it was
@@ -1294,6 +1346,7 @@ on are used (`taskset`, a container's cpuset).
 | `MAYA_DS4_CPU_LANE` | measured | `cores`, `pcores`, `node` or `smt` (a thread per logical CPU): that way, nothing is measured |
 | `MAYA_DS4_CPU_LANE_CPUS` | unset (natural core order) | an ordered comma-separated CPU list for one CPU-lane part: listed allowed CPUs are pinned first, duplicates and disallowed CPUs are ignored, and every unlisted allowed CPU is appended in its original order. Use it to spread workers across CCD/L3 groups without applying `taskset` to the rest of the engine; only worker affinity changes, never the arithmetic. See [CPU-lane ordering](DS4_CPU_LANE_ORDER.md) for an example and measurements |
 | `DS4_COPY_NUMA` (the config's `"env"`) | 2 parts at most | the CPU lane's RAM copies of its experts in this many NUMA parts, `1`-`4`, each on its own node with a worker pool there - so a host of three or four sockets uses them all (the default takes two). 4x Xeon E7-8880 v4 (88 cores), Maya-S + DSpark, `--mmap-experts off`: two RTX 3090s (a pair on sockets 0-1, and one on 2-3, two runs each on the first) 37-39 -> 49 tok/s decode, after a 68K prompt 24-26 -> 32-33 tok/s, the prompt read 644-655 -> 805 tok/s on the first pair (802 both ways on the second); four RTX 3090s (less on the CPU lane) unchanged |
+| `MAYA_DS4_COPY_ROOM` | on (Linux, two NUMA parts or more) | an EXL3 pack: each NUMA node makes room for its part of the CPU lane's RAM copies before they are filled: a node whose free memory is short but which holds file cache (another model's files, read before this start - the usual state after a switch of models) releases that much of the cache first, through the kernel's own reclaim, never more than the node holds. Without it the kernel lends the part's memory from the other node before it reclaims (the copies prefer their node, they do not require it), so one node's workers read their weights across the sockets and part of the copies lose their huge pages. The copies' memory is then touched at once, before the load's own reads fill the room again. 2x Xeon Gold 6152, RTX 3090 + eight RTX 5060 Ti, EXL3 3.5 bpw (142.6 GB of copies), 157 GB of another model's files in the cache at the start: the copies 115 / 35 GB on the two nodes (109 GB of them on huge pages) -> 82 / 68 GB (all on huge pages, as a start with the memory free), the load 804 -> 175 s, decode 55.4 -> 60.7 tok/s greedy and 54.4 -> 60.5 at temperature 1 (five prompts, 384 tokens each, DSpark; a start with the memory free: 63.2 / 60.1 before, 62.6 / 61.2 with it). The log says what each node released (`ds4: NUMA node 1 had ... GB free ...`). `0`: the copies wherever memory is free, as before |
 | `MAYA_DS4_LANE_SPIN_US` | 20000 | the lane's workers spin this many us idle before they sleep (0 .. 1000000): a decode hands the lane work on few layers, and on an APU a shorter spin leaves the integrated GPU more of the shared power (the answers are the same) |
 | `MAYA_DS4_CPU_SPLIT_COLS` | off | `1`: a call of few EXL3 experts on the lane (a decoded token's one or two a layer) has its gate / up and down pieces cut by columns too, so more of the lane's threads share it. A step is cut only where its pieces would leave threads idle for a whole piece (fewer than 8 jobs a thread), into the equal runs that take the fewest rounds; a call of more experts runs as before. Each output is the same sum in the same order, so the answers are the same bit for bit (`ds4_cpu_split_test` checks it; with the engine's own `DS4_CPU_FLOW_CHECK=1` - that bare name, in the config's `"env"`, as the engine reads no `MAYA_` or `STRATA_` name of it - each call is checked against the uncut steps). Off until measured: it may help where the lane has many threads for the few experts a layer leaves it |
 | `MAYA_DS4_CPU_W16` | off | `1`: on a CPU whose lane runs the AVX2 tier (no AVX-512), the EXL3 experts' codebook products and byte sums are computed in 16-bit lanes, a tile row's two halves at once (an expert's call of 1-3 tokens; 4 or more keep the 32-bit path) - fewer of the uops that Haswell and Broadwell run on one port only. The same byte sums and the same float steps, so the answers are the same bit for bit (`exl3_cpu_w16_test` checks it; `DS4_CPU_W16_CHECK=1`, the engine's bare name, checks each lane call against the 32-bit path). The log says whether it took (`ds4: CPU lane: EXL3 codebook products in 16-bit lanes on`); other tiers ignore it. Off until measured: CPUs with more integer-multiply ports (AMD Zen) may not gain |
@@ -1787,7 +1840,10 @@ model's files (each read again, so those prompts are not timed); a difference fa
 
 On AMD the engine measures hipBLASLt's kernels for each prompt GEMM shape at its first use on a GPU and keeps the
 picks in `<pack>/lt-picks.txt`, so later starts reuse them. A pack whose files must not change (one shared between
-installs, or checked by hash before each start) can keep them elsewhere.
+installs, or checked by hash before each start) can keep them elsewhere. Where the file does not open for writing (a
+pack mounted read-only), the log says so once, with the file, the errno and the setting that moves it (`ds4 gemm: the
+measured hipBLASLt picks are not kept - ...`); the picks then last until the engine stops. Hy4-Flash keeps its picks
+the same way (`HY4_LT_STORE`), and maya-mm3 too (`MAYA_MM3_LT_STORE`).
 
 | Setting | Default | |
 | --- | --- | --- |
@@ -2499,7 +2555,10 @@ free VRAM its start's choices hold with, against what the setup's reading saw. T
 `data/vram-room.json` for this PC, the card and its driver (a new driver or card is measured again), and from then on the setup's line says
 "measured" instead of "estimated"; the Models page counts it too. With a measured figure the setup claims the
 drafter by its sums without their safety margin, as the engine then decides (the contexts and the cache's rows keep
-theirs). Linux and AMD cards are counted as before.
+theirs). A config on several cards (a layer split or tensor parallel) is measured at its first start on them
+together: the engine also says how much less free on every card at once its choices hold with, and each card's share
+is kept for that set of cards (a start on one of them alone is measured on its own). Linux and AMD cards are counted
+as before.
 
 **Not available for Hy4-Flash yet** (the dashboard offers no switch for them): `--parallel` (one request at a time
 for now); Mac, and AMD on Windows.
@@ -2555,8 +2614,9 @@ share of them over PCIe to its own GPU, once for both halves of the chunk. `--tp
 GPUs or more where it holds half of the experts or more, `--tp N` wherever the members' own parts fit; a group of 2
 keeps the layer split under `--tp auto` (its prompts read faster there) unless `HY4_TP_LANE=1`, and `HY4_TP_LANE=0`
 keeps the layer split for every group (the INFO line says what the group would hold); the cache is then in 8-bit rows
-where `--kv auto` allows and the MTP block's pass runs in line. With `HY4_HOT=1` such a group places its experts at
-the start by the routing its earlier answers left in the file and trades none during answers. Where the group cannot hold the model's own parts
+where `--kv auto` allows and the MTP block's pass runs in line. With `HY4_HOT=1` (asked for: off by default with
+tensor parallel) such a group places its experts at the start by the routing the file holds and trades none during
+answers. Where the group cannot hold the model's own parts
 and the context's caches (every member keeps a copy), the layer split runs instead, and an INFO line says why.
 
 **Where the experts live.** All of them in VRAM where they fit (about 108 GB with Q4_K_M), on tensor parallel or a
@@ -2592,9 +2652,27 @@ prompt speed are the same either way.
 beside them). `--mtp` loads the GGUF's MTP block (its BF16 weights rounded to Q8_0 at load; its copy of the output
 head for the drafts' top token in Q4_K - only how often a draft holds depends on it) and drafts up to
 `--draft` tokens a step; the model checks them in one window, so the tokens are the model's own: greedy answers are
-the same with and without it on the same placement, and with sampling a draft is kept with the model's probability of
-it. (The MTP block's VRAM can move a layer, or a share of the experts, to another GPU, which rounds a little
-differently: a near-tie can then go the other way.)
+the same with and without it, and with sampling a draft is kept with the model's probability of it. The VRAM plan
+counts the room of the drafter the start runs only - none without one, so the routed experts get all of the VRAM -
+and a pack with the MTP block and the DFly2 drafter keeps room for the one it runs; an automatic prompt chunk is the
+one beside that room (it may be smaller than without the drafter). Within a start, drafts on and off (a request's
+own) give the same answers. Where a drafter's room would change more than that - the cache's rows, the dense prompt
+span, KV streaming, the GPUs' layout - the start leaves it out and says so ("INFO the MTP block is not loaded: ..."),
+and decodes without drafts; `--kv q8` (the 8-bit rows by hand) gives it room on a card where F16 rows and the block
+do not fit together.
+
+**`--drafting auto`** (what the setup writes for a Maya size whose pack holds a drafter): the first start on a PC
+loads each choice once with its own VRAM plan - no drafting, the MTP block, the DFly2 drafter (one GPU) - and times a
+short greedy decode of each on three chat requests in the model's template (192 tokens in all; the first choice reads
+them once more untimed before, so no choice pays the disk's first reads of the n-gram table) - before the engine is
+ready: a load and a few short answers a choice, roughly one to two minutes in all on one GPU, where part of the model
+runs on the CPU then about one minute more for its CPU lane and prompt route (the server says the time left at this
+PC's pace after each choice); the fastest is kept (within 2%, the one with less VRAM of its own: no drafting, then DFly2,
+then the MTP block) and remembered in `data/hy4-drafting.txt`, per PC, GPUs, model and start options - the starts
+after read it and skip the measuring, so they give the same answers. `maya --speed-calibration` measures again.
+`--drafting on`: the faster of the drafters (never none); `--drafting off`, `mtp`, `dfly2` (the setup's `--drafting`,
+or Drafting on the Models page): that choice by hand, nothing measured - its VRAM plan can differ from the measured
+one's, so an answer may be worded slightly differently than with the measured choice.
 
 Measured by the engine's contributor (@needmorevram) on his own PC, with AngelSlim's Q4_K_M set, not with Maya's
 files - a 9-GPU NVIDIA PC (an RTX 3090 and eight RTX 5060 Ti on PCIe 3, two Xeon sockets):
@@ -2652,6 +2730,20 @@ the size (`INFO pictures up to N pixels on this GPU`, and `vision_max_pixels` to
 off` loads no tower; `--vision on` asks for it by name and stops with an error where it does not load.
 `HY4_VISION_LEND=0` keeps the room free between pictures instead (the earlier behaviour).
 
+**KV streaming and KV spill (Hy4-Flash).** The 12 indexed layers (and the MTP block) keep one cache row a position,
+but a token's attention reads only the 2,048 positions its indexer picks. `--kv-streaming auto` (the default) keeps
+the newest 32,768 positions' rows in VRAM and every position's row in pinned RAM where the context does not fit in
+VRAM otherwise; with `HY4_KV_MORE=1` (opt-in) also where it fits but not every routed expert does and the freed VRAM
+gives every layer more experts (not where the DFly2 drafter is planned: it reads the rows in VRAM only). Nothing is read from RAM until a
+conversation passes the 32,768 positions, and the rows read are the same bits, so the answers are the ones of the
+same placement without streaming. `--kv-streaming off` keeps every row in VRAM, `on` streams wherever the context is
+larger than `--kv-resident N` (default 32768). Where the RAM does not hold every position's row either,
+`--kv-spill auto` (the default) keeps the newest positions' rows in RAM and writes the others to a file on a drive
+(`--kv-spill-dir D`, default the model's directory; deleted when the engine stops); a token's picks that are on the
+drive only are read from it before its attention (the same bits). The start measures the drive once and refuses a
+drive that reads slower than 10 MB/s in 4 KB pieces one at a time (a hard disk; an NVMe reads about 50). `--kv-spill off` never uses a drive; `on` asks for
+it where the context is streamed.
+
 Engine options, in the config's `"args"`:
 
 | Option | Default | What it does |
@@ -2701,12 +2793,21 @@ A request's `spec` (0 / 1) turns the drafts off or on for it.
 | `HY4_TP_DOWN` | on | `--tp auto`: where the largest group does not hold the model and the context, groups of one GPU fewer down to 2 are tried before the layer split (an INFO line says so). `0`: the largest group or the layer split, as before |
 | `HY4_DENSE_MAX` | picked at the start | prompts: up to how many earlier positions the 12 indexed layers' attention runs on the tensor cores (one FP16 product over every earlier key, the indexer's picks kept by a mask) before it goes to the gathering kernel the token path uses. Both read the indexer's same picks, so the limit moves no pick - only how a token's attention is summed (answers can differ in the last bits, as between two prompt chunks). The tensor-core path's time grows with the positions, the gathering kernel's does not: on Tesla V100s they cross at about 24,000. At every start the engine takes the largest of 24576 / 16384 whose buffers (about 215 MB a GPU for 24576, a third of that on a tensor-parallel member) fit the plan without costing the layout, the cache's rows, the pictures, the MTP pass's own scratch, the output head's rows over the members (`HY4_TP_HEAD`) or a routed expert its place in VRAM, on GPUs with tensor cores (compute capability 7.0 and later), and 8192 otherwise; its start line says which (`INFO prompts: the indexed layers' attention on the tensor cores up to N positions`). So GPUs that hold every expert (tensor parallel, a layer split with room) take a longer span, and a card that holds a part of the experts beside the CPU lane keeps 8192 - its decoding and its answers stay as they were. `HY4_DENSE_MAX=N` tries N alone (up to 65536; it is taken where the plan holds it, also where it moves some experts from the VRAM to the CPU lane: on one Tesla V100 a 16K prompt read 7% faster with 24576, with 1.5% fewer experts in VRAM); `HY4_DENSE_MAX=8192`: as before v1.1.68 |
 | `HY4_VISION_LEND` | on | `0`: a picture's room is not lent by the prompt buffers - it is kept free on the main GPU between pictures and allocated for each (the earlier behaviour; for comparisons) |
-| `HY4_ROUTE` | by the measured rates | debugging, a PC whose routed experts are not all in VRAM: `stream` or `lane` pins where a prompt chunk's other experts are computed (streamed to the GPU / the CPU lane). The engine picks per layer and chunk by its own timings, and the two routes sum a token's experts in another order, so two starts can differ in the last bit and a long greedy answer can part ways; pinned, runs and builds compare token for token |
+| `HY4_KV_MORE` | off | `--kv-streaming auto`: `1` streams also where the context fits but the freed VRAM gives every layer more routed experts (opt-in: a long prompt read ~1% slower on a V100) |
+| `HY4_KV_SPILL_RES`, `HY4_KV_SPILL_SLOTS`, `HY4_KV_SPILL_MIN_MBS` | by the RAM; 32768; 10 | KV spill: the newest positions whose rows stay in RAM; the rows a layer's read may bring from the drive at once; the slowest drive (MB/s in 4 KB reads) auto takes |
+| `HY4_ROUTE` | by the rates measured once on this PC | a PC whose routed experts are not all in VRAM: where a prompt chunk's other experts are computed - streamed to the GPU or on the CPU lane. The two routes sum a token's experts in another order, so the engine does not pick by the moment's timings: it picks per layer and chunk by two rates this PC measured once (the lane's time an expert-token, each GPU's streaming time a MB) - the same prompt takes the same routes and gives the same tokens from start to start. Not yet measured: the first start's prompt chunks take the two routes in turns, timed once the lane's experts are warm, until two windows agree (its log says `prompt route: ...`); the rates are remembered per PC, GPUs and driver, model, layout (each layer's VRAM experts, the chunk) and lane kernels in `data/hy4-prompt-route.txt` (`HY4_ROUTE_FILE` names another file; without one: beside `HY4_Q4X_FILE`, else beside `--profile`); a new layout or new lane kernels are measured again, and `--speed-calibration` measures again (`HY4_ROUTE_MEASURE=1`). `stream` or `lane` pins the route (runs and builds compare token for token) |
+| `HY4_MEASURE`, `HY4_MEASURE_IDS`, `HY4_MEASURE_S` | on, with the server's text, 300 | the first start on a PC: what `HY4_Q4X` and `HY4_ROUTE` would measure while the first answers read their prompts (2.5-3x slower then) is measured before the engine says READY - on `HY4_MEASURE_IDS`, a file of token ids (the server writes this install's `docs/SETTINGS.md` and `README.md` in the model's tokens into `data/hy4-measure-ids-<tokenizer>.txt` once), with the same timing code: a prompt chunk and 64 tokens give the routing counts the 4-bit copies are made by, then the text goes on a token at a time until the copies' turns decide, then it is read in chunks of the prompt's size until the route's windows agree. The log says `measuring this PC once ...` and `measured this PC once in N s ...`; both results are remembered as before, so the starts after skip it, and the first answer then reads its prompt by the rates the later starts use (the same tokens as theirs). Only where the results are remembered (a data folder named); `HY4_MEASURE=0`, no file, or not decided within `HY4_MEASURE_S` seconds: the answers measure the rest, as before |
+| `HY4_LAST_ALONE` | on | `--serve`: a prompt's last token is read alone on the token path after the rest, as a repeat of the request (its prompt in the caches) reads it - the first answer and every repeat begin from the same row (one extra step a new prompt), on every layout. `0`: off |
+| `HY4_DRAFT_FILE`, `HY4_DRAFT_MEASURE` | the data folder's `hy4-drafting.txt`; off | `--drafting auto` / `on`: where the drafting measured once on this PC is remembered (the server's data folder; the engine alone: beside `HY4_Q4X_FILE` or `--profile`, else not measured - the MTP block drafts); `HY4_DRAFT_MEASURE=1` measures again (`maya --speed-calibration` drops the file). `HY4_DRAFT_TOKENS` (192), `HY4_DRAFT_ROUNDS` (3), `HY4_DRAFT_PROMPT` (512), `HY4_DRAFT_TIE` (0.02): the timed decode, its prompts, their length, the tie |
+| `HY4_FETCH` (`--gpu-fetch`) | off | decode: the routed experts VRAM does not hold copied into pinned RAM, and the GPU fetches the ones a token routes to it itself. `gpu`: all of them on the GPU; `mix:K`: each token's first K others a layer on the GPU, the rest on the CPU lane; `lane`: the CPU lane alone (no copy); `auto`: the three timed once at the first start on the same tokens and the fastest kept (the lane unless another is 3% faster), remembered per PC (`HY4_FETCH_FILE`; `HY4_FETCH_MEASURE=1` or `--speed-calibration` measures again); a lane verdict gives the copies back at once. `HY4_FETCH_GB`: the most RAM the copies take |
+| `HY4_LANE_RESERVE`, `HY4_LANE_RESERVE_CORES` | auto | the CPU lane of the size the engine picks (12 cores or more): a few cores (min(4, cores / 8)) left out of its threads only while other programs keep the PC busy (measured, with hysteresis), so a busy PC's lane does not wait for a core it shares; `1`: always left out; `0`: never; `_CORES`: how many |
+| `HY4_ATTN_WMMA`, `HY4_IX_WMMA` | on for RDNA 3 / 3.5 (gfx11) | AMD, prompts past 8,192 positions: the indexed layers' attention over the picked keys (`ATTN`) and the indexer's scores (`IX`) on the matrix cores (WMMA). `0`: the earlier kernels; `HY4_ATTN_WMMA=1`: RDNA 4 (gfx12) too |
 | `HY4_IX_GEMM`, `HY4_IX_GEMM_FROM` | `16` on NVIDIA, `0` on AMD; from 8,192 positions | prompts: the indexer's scores past the given position count as FP16 (`16`) or F32 (`32`) products on the tensor cores instead of the token kernel; `0`: the token kernel as in v1.1.68. The picks are the same except where two scores at the threshold are a rounding apart |
 | `HY4_SPARSE`, `HY4_SPARSE_SUB`, `HY4_SPARSE_FRAC` | on where the tensor-core span is tried (NVIDIA), `0` on AMD | prompts: the indexed layers' attention past the dense span gathers the rows the neighbouring tokens pick once and runs the dense products over those rows alone (each token's own picks kept by a mask); `0`: the gathering kernel as before. `_SUB`: the tokens a gathered piece; `_FRAC`: the share (percent, 75) of the dense span's rows under which the gathered rows are taken inside the span (`0`: the span's own dense path there) |
 | `HY4_IX_SPLIT`, `HY4_IX_SPLIT_FROM` | on with tensor parallel on NVIDIA; from 8,192 positions | tensor parallel, prompts: each GPU scores and picks its share of a chunk's sub-batches and the cards swap the picks (16-bit pool numbers through the host's memory) instead of every GPU doing all of it; `0`: as before |
-| `HY4_HOT`, `HY4_HOT_EVERY`, `HY4_HOT_SWAPS`, `HY4_HOT_FILE` | off | opt-in (the wording can differ from without it): on a PC whose GPU holds only some of a layer's experts, the experts in VRAM follow the ones the answers use - every `_EVERY` (8) token steps up to `_SWAPS` (64) cold ones trade places with hotter CPU-lane ones, more between requests - and a start places each layer's most-used first; the scores are kept in `_FILE` (`<pack>/expert-hot.bin`). `HY4_HOT_LOG=1` logs the swaps |
+| `HY4_HOT`, `HY4_HOT_SWAPS`, `HY4_HOT_FILE`, `HY4_HOT_LEARN` | on (tensor parallel: off) | on a PC whose GPU holds only some of a layer's experts, the experts in VRAM follow the ones the answers use - between requests the cold ones trade places with hotter CPU-lane ones (`_SWAPS`: at most that many a time; all by default), an answer runs on one placement, so drafting on or off gives the same answers - and a start places each layer's most-used first (faster decoding where it acts; the wording can differ from `HY4_HOT=0`, measured no further from the full model). The start's scores are kept in `_FILE` (the server: `data/hy4-expert-hot-<model>.bin`; the engine alone: `<pack>/expert-hot.bin`): the first start learns them from its answers and writes them, the starts after read them as they are - so every start begins the same and the same requests give the same tokens; `--speed-calibration` (or `_LEARN=1`) learns them again. Where no layer has experts both in VRAM and on the CPU lane it does nothing. `HY4_HOT=0` turns it off, `HY4_HOT=1` asks for it with tensor parallel (its start placement only); `HY4_HOT_LOG=1` logs the swaps |
 | `HY4_LT` | on (AMD) | AMD: the prompt path's FP16 matrix products run through hipBLASLt with the fastest kernel measured for each shape on the PC; `0`: hipBLAS as before (the sums are in another order, so wording can differ slightly) |
+| `HY4_LT_STORE` | `<pack>/lt-picks.txt` | AMD, with `HY4_LT`: the measured kernels kept in this file instead (a pack mounted read-only, or one whose files must not change); empty: none kept, each start measures its own |
 | `HY4_TP_CHECK` | off | debugging: after each forward, every member's copy of the state compared |
 | `HY4_TP_HEAD` | on | tensor parallel with a BF16 output head: each member computes its share of the head's rows (the main GPU one share) from its own copy of the final state and copies its logits straight to the host; `0`: the main GPU alone |
 | `HY4_TP_HEAD_UNITS` | 1 | with `HY4_TP_HEAD`: the main GPU's share of the head's rows, in members' shares |
@@ -2737,6 +2838,51 @@ A request's `spec` (0 / 1) turns the drafts off or on for it.
 | `HY4_PROF` | off | debugging: each forward's GPU time by part |
 | `HY4_DUMP` | off | debugging: each layer's sums |
 | `HY4_INJECT`, `HY4_INJECT_FROM`, `HY4_SAVE` | off | debugging: a layer's inputs taken from a reference dump to compare one layer at a time |
+
+## Inkling-2-Small
+
+thinkingmachines' [Inkling-2-Small](https://huggingface.co/thinkingmachines/Inkling-2-Small) (594B, ~17B active) on
+its own engine, `maya-ik2` (`src/ik2`; CUDA on Linux, Ampere on), from unsloth's GGUFs
+([unsloth/Inkling-2-Small-GGUF](https://huggingface.co/unsloth/Inkling-2-Small-GGUF): UD-Q4_K_XL, UD-Q3_K_XL) read in
+place. The routed experts sit in pinned host memory (~323 GiB for UD-Q4_K_XL, ~260 GiB for UD-Q3_K_XL) with a cache of
+them in VRAM; one request at a time, text only. `maya.py` does not set it up yet: docs/INKLING2.md section 6 has the
+tokenizer folder and the run config, then `python serve/server.py --engine maya --config ik2.json`.
+
+**Defaults**: temperature 1.0, top-p 1.0 (its card and files name none); the thinking level Auto, the template's own
+(0.9 - "high"). The template is thinkingmachines' (`tools/ik2/chat_template.jinja`), which takes every level by name:
+none, low (0.2), medium (0.7), high (0.9), xhigh and max (0.99); Off is none.
+
+Engine flags: `--max-context N` (262144), `--cache-gb N` (60: the expert cache's most, less if VRAM is short),
+`--gpus 1|2`, `--threads N` (8: the loading and the CPU lane), `--eos a,b`. Environment:
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `IK2_KV` | `f16` | `fp8`: the KV cache in FP8 E4M3, half the bytes (the full layers' 32 KB a token -> 16 KB); against the reference it changed 5 of 48 top-1 tokens where FP16 changed none (docs/INKLING2.md 6.1) |
+| `IK2_WARM` | off | a profile of how often each expert is picked (written by `IK2_POP_OUT=FILE` over some prompts): the cache filled with the most picked at load, and the prompts' prefetch seeded with the counts. The first requests then do not start from an empty cache (a 600-token first request 7.0 -> 4.2 s on an H200) |
+| `IK2_UNSUPPORTED` | off | `1`: `maya-ik2` runs outside the Inkling 2 preview where it can run at all - two GPUs, less than 22 GiB of VRAM, Windows (untested). Off, the engine stops at the start with one line saying why (docs/INKLING2.md 8). A GPU older than sm_80 never runs it |
+| `IK2_EP` | off | `1` with `--gpus 2` (and `IK2_UNSUPPORTED=1`): expert parallel - each layer's experts dealt to both GPUs by how often they are picked, each GPU its own cache and link; attention and the KV cache on GPU 0. Decode 22 -> 42 tok/s on two RTX PRO 6000s. Off, `--gpus 2` splits the layers |
+| `IK2_EP_SPLIT` | `0.55` | GPU 1's share of the picks under `IK2_EP` (GPU 0 also holds the dense weights and the cache of the KV) |
+| `IK2_TP` | off | `1` with `--gpus 2` (and `IK2_UNSUPPORTED=1`): the experts tensor parallel instead (each GPU half of every expert): decode 42.8 vs EP's 41.3 tok/s, prompts slower |
+| `IK2_CPU` | off | `1`: in decode, a missing NVFP4 expert computed on the CPU (AVX-512) when that is sooner than its copy over PCIe (H200 node, with `IK2_CPU_LAZY=0`: 34.5 -> 36.2 tok/s); one GPU only. `IK2_CPU_LAZY=0`: such an expert is not copied into the cache afterwards either (the link carries less) |
+| `IK2_SUP` | 16384 (4096 when VRAM is short) | the tokens of one layer-major prompt pass (each pass copies every expert it misses once); a pass's scratch (~280 KB a token) comes out of the expert cache |
+| `IK2_PF_P` | `0.999` | the prompt prefetch: an expert is copied ahead when the chance that some token of the layer picks it is at least this |
+| `IK2_WGMMA` | on | `0`: the mma.sync attention on Hopper too (the wgmma one needs a build with sm_90a) |
+| `IK2_ALLOC` | mmap + register | `hostalloc`: the experts' host memory by `cudaHostAlloc`, which pins ~3 GiB/s (load 110-190 s instead of ~50-75 s) |
+| `IK2_HOST` | pinned; `mmap` when every expert stays in VRAM | `mmap`: the experts read through the page cache instead of pinned (for a host without the RAM: unusably slow from network storage, 0.34 tok/s). With every expert in VRAM they are copied there straight from the mapped files and no pinned copy is kept (Inkling-2-Mini loads in 3 s from the page cache) |
+| `IK2_FAST` | on when every expert fits in VRAM | the resident token path (docs/INKLING2.md 8): every expert in VRAM, a token's launches with nothing from the host between its embedding and its logits. `0`: tokens take the cache path |
+| `IK2_GRAPH` | on | `0`: the resident path's launches one by one instead of a CUDA graph a token (for profiling: nsys does not see inside a graph) |
+| `IK2_ATTN_MMA` | `1` | a token's attention on the tensor cores, a warp straight from the KV cache (65,536 tokens deep on an RTX 3090: 63 -> 77 tok/s with an FP16 cache, 53 -> 84 with FP8). `0`: the scalar kernels; `2`: the layers without a window only |
+| `IK2_EXPERT_MMA`, `IK2_EXPERT_MMA_SPLIT`, `IK2_EXPERT_MMA_SPLIT_DOWN` | `1`, `8`, `4` | a token's NVFP4 experts on the tensor cores straight from their blocks (resident path): the gate / up input as two FP16 limbs in two columns, a code times its scale exact in FP16, FP32 sums. A group of 16 rows is a block of `SPLIT` warps, each a stride of the 64-value blocks (the weights in flight). One RTX 3090, Inkling-2-Mini: 121 -> 127 tok/s. `0`: the scalar kernels (also what Q8_0 experts take) |
+| `IK2_DRAFT_WIDTH` | `5` | `--draft` on Inkling-2-Mini's resident path: the widest window a step verifies (the anchor and its drafts, 2 .. 8) |
+| `IK2_DRAFT_ADAPT`, `IK2_DRAFT_PROBE`, `IK2_DRAFT_DECAY` | `1`, `8`, `0.85` | the controller: a window only when its expected tokens over its measured time beat a plain token's; after `PROBE` plain tokens one window to look at the acceptance again; `DECAY` how fast the acceptance is forgotten. `IK2_DRAFT_ADAPT=0`: always `IK2_DRAFT_WIDTH` wide |
+| `IK2_DRAFT_CTX` | the context | the positions the drafter's layer without a window sees (the last ones; its cache FP16, 4 KB a position): `65536` keeps 262144 resident on a 24 GB card |
+| `IK2_BLOCK`, `IK2_BLOCK_CHECK` | `1`, `0` | `0`: a verify window through forward() instead of the block path; `n`: the first n windows through both, their logits compared |
+| `IK2_RG_SLOTS` | 96 tokens' picks | with every expert in VRAM, a prompt of up to this many slots (tokens x picks) has its experts read by groups - an expert's blocks once for up to 8 of its tokens - instead of decoded to FP16 for a GEMM (a chat turn of 12 new tokens 118 -> 56 ms). `0`: never |
+| `IK2_CAND` | on | sampling takes the largest logits found on the device (a thousand and a few more) instead of the vocabulary's logits every token (100 -> 110 tok/s at temperature 1; the same tokens for the same seed). `0`: the logits |
+| `IK2_FLASH`, `IK2_MV`, `IK2_GROUP`, `IK2_OVERLAP`, `IK2_PREFETCH`, `IK2_SCAN`, `IK2_RELB`, `IK2_BORROW` | on | A/B switches (`0`): the paths these replaced - the attention through logits in memory, few tokens' experts through the GEMMs, no grouping, copies on the compute stream, no prefetch, plain LRU in prompt passes, no relative-bias table, no scratch lent from the cache for long prompts |
+| `IK2_DENSE` | FP16; `q8` when every expert stays in VRAM | `q8`: the dense weights kept as the GGUF's Q8_0 blocks (half an FP16 copy's bytes), a token's products straight over them, planar (`mv_q8p`); a prompt chunk decodes a matrix to FP16 for its GEMM. `f16`: the FP16 copy |
+| `IK2_PROF`, `IK2_STATS` | off | each request's time by phase; where its experts came from (cached, prefetched, copied on a miss, the CPU) |
+| `IK2_TRACE`, `IK2_POP_OUT`, `IK2_FORCE`, `IK2_LOGITS_OUT`, `IK2_MARGIN`, `IK2_VERIFY_CHECK`, `IK2_UP_MS`, `IK2_ALLOC_THREADS` | off | measurement: every layer's picks to a file; the pick counts (for `IK2_WARM`); fixed tokens fed (`--tokens` runs: two builds compared on the same text, and how often each one's pick agrees); every generated token's logits to a file (with `IK2_FORCE`: two builds' logits over the same tokens); the drafter's checks (`--draft`); the CPU lane's estimate of an expert's copy time; threads allocating host memory |
 
 ## GLM-5.3 (744B)
 

@@ -89,6 +89,11 @@ class Boxes(unittest.TestCase):
         calm = {**m, "tiers": {**m["tiers"], "now": {**now, "vram_hit": 0.9}}}
         self.assertNotIn(D.TIPS["ds4_cpu"][0], text(D.tiers(calm, 120), 122))
 
+    def test_ik2_says_it_reports_no_tiers(self):   # (maya-ik2 writes no STAT lines: no "while it writes" promise)
+        out = text(D.tiers({"engine": {"engine_kind": "ik2", "model": "Inkling-2", "kv": "fp8"}}, 120), 122)
+        self.assertIn("reports no tiers", out)
+        self.assertNotIn("while it writes", out)
+
     def test_the_tiers_bar_fits_when_the_tiers_overlap(self):   # (Maya-L on 9 GPUs: 10,813 + 1,571 of 12,096)
         now = {**METRICS["tiers"]["now"], "vram_used": 10813, "ram_used": 1571}
         m = {**METRICS, "engine": {**METRICS["engine"], "experts": 12096}, "tiers": {**METRICS["tiers"], "now": now}}
@@ -307,6 +312,30 @@ class Loading(unittest.TestCase):
         blind = D.LoadWatch(None, [0])
         self.assertIsNone(blind.fraction())
         self.assertIn("so far", text(D.loading(blind, 60)))
+
+    def test_a_first_start_measuring_this_pc(self):   # (maya-hy4: its choices measured once, before it is ready)
+        w = self.watch(["maya-hy4: measuring this PC once, before the first answer: the prompt route (up to 10 chunks "
+                        "of 4096 tokens) - on 56132 tokens of text, 300 s at most; remembered, the next starts skip it"],
+                       gpus=(0,))
+        self.assertTrue(w.measuring)
+        self.assertIn("Measuring this PC once", text(D.loading(w, 60)))
+        w = self.watch(["maya-hy4: measuring this PC once, before the first answer: the prompt route",
+                        "maya-hy4: measured this PC once in 23 s, before the first answer (...): the prompt route's "
+                        "rates remembered"], gpus=(0,))
+        self.assertFalse(w.measuring)
+        self.assertIn("Reading the model's weights", text(D.loading(w, 60)))
+        # (--drafting auto: the drafting trial in plain words with roughly how long, then the time left at the PC's pace)
+        w = self.watch(["maya-hy4: measuring this PC once, before the first answer: drafting (no drafting, the MTP "
+                        "block, the DFly2 drafter: a load and 3 short answers each) - on 56132 tokens of text; "
+                        "remembered, the next starts skip it"], gpus=(0,))
+        self.assertIn("which drafting answers fastest: 3 choices", w.measuring)
+        self.assertIn("one to two minutes", text(D.loading(w, 60)))
+        w = self.watch(["maya-hy4: measuring this PC once, before the first answer: drafting (no drafting, the MTP "
+                        "block: a load and 3 short answers each) - on 56132 tokens of text",
+                        "maya-hy4: measuring this PC: 1 of 2 choices done in 41 s - about 30 s more"], gpus=(0,))
+        self.assertEqual(w.measure_left, 30)
+        self.assertIn("2 choices", w.measuring)
+        self.assertIn("more)", text(D.loading(w, 60)))
 
 
 @unittest.skipIf(T is None, "Textual is not installed (./maya.sh --setup installs it)")

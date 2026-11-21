@@ -70,7 +70,24 @@ size_t kv_q8_row_bytes(int kv_lora, int n_rot);
 struct KvHost {
     int* tag = nullptr;
     uint16_t* rows = nullptr;
+    // KV spill (the rows past what the RAM holds on a drive): hidx [positions] (device) the host slot of each position
+    // (-1: on the drive only, -2: claimed by kv_need), the newest hres positions in slots p % hres (htag [hres],
+    // device: the position each holds), the slots past them the rows a read brought from the drive (kv_need, then the
+    // host, then kv_hidx).  hidx nullptr: position p's row at p, as before
+    int* hidx = nullptr;
+    int* htag = nullptr;
+    int hres = 0;
 };
+/// KV spill: the positions a read takes that are neither in the VRAM ring nor in host memory, each once (hidx -1 ->
+/// -2), into miss [cap] (host memory, mapped) with their count in mcount (device; the caller zeroes it); the slots
+/// past the newest tier the read takes get fgen [slot - hres] = gen (host memory, mapped: kept while the host makes
+/// room).  The positions: keys (T rows of ldk, nk[t] each) when given, else list's pools (n of kpool positions, those
+/// below kend), else the span [k0, k0 + n).
+void kv_need(const int* keys, int ldk, const int* nk, int T, const int* list, int kpool, int kend, int k0, int n,
+             int ring, const KvHost& hs, int* fgen, int gen, int* miss, int* mcount, int cap, cudaStream_t s);
+/// ... then hidx[set[2i]] = set[2i + 1] (n_set rows the host put in slots) and hidx[drop[2i]] = -1 where it still is
+/// drop[2i + 1] (the slots given back); set and drop in host memory (mapped)
+void kv_hidx(const int* set, int n_set, const int* drop, int n_drop, int* hidx, cudaStream_t s);
 void kv_store(const float* kv, int T, int kv_lora, int n_rot, const float* w, float eps, const int* pos, float base,
               uint16_t* cache, int ring, cudaStream_t s, bool q8 = false, const KvHost& hs = KvHost{});
 /// The picked rows of a sub-batch side by side: dst[t * ldk + j] = the cache row (row_bytes bytes, F16 or 8-bit: as
@@ -95,6 +112,14 @@ size_t attn_ws_floats(int T, int H, int kv_lora, int max_keys);
 void attention(const float* q, int T, int H, int kv_lora, int n_rot, const uint16_t* cache, int ring, const int* keys,
                int ldk, const int* lo, const int* nk, int max_keys, float scale, const float* sinks, float* ws,
                float* out, cudaStream_t s, bool q8 = false);
+/// The same over keys[t][0 .. nk[t]) on an RDNA GPU's matrix cores (gfx11; HY4_ATTN_WMMA=0 off, =1 also gfx12): a
+/// prompt's tokens past the dense span - within rounding of attention's sums (F16 products of a split query and
+/// split probabilities, in another order), so never a token window's.  false: not taken (another GPU, H not a
+/// multiple of 16, no keys) - attention then.  attn_wmma_on: whether this device takes it.
+bool attn_wmma_on();
+bool attention_wmma(const float* q, int T, int H, int kv_lora, int n_rot, const uint16_t* cache, int ring,
+                    const int* keys, int ldk, const int* nk, float scale, const float* sinks, float* out,
+                    cudaStream_t s, bool q8 = false);
 
 /// x *= sigmoid(g), n values
 void sigmoid_mul(float* x, const float* g, size_t n, cudaStream_t s);
@@ -113,12 +138,49 @@ void router(const float* logits, int T, int n_exp, const float* bias, int n_used
 /// grp_ptr[g] = base + expert * stride, grp_start[g .. g + 1] its entries in grp_ent, *n_groups
 /// slot (null: none): each expert's slot among the VRAM ones (base + slot stride), -1 for the CPU lane's - those entries
 /// are left out and their weight w[t][j] zeroed (the lane adds their part)
+/// (eptr, the GPU fetch's: each expert's blob wherever it lies - a VRAM slot, a staging slot, pinned RAM - 0 for none
+///  of this GPU's; who [T][n_used], when given: 1 for an entry the CPU lane computes - left out, its weight zeroed -
+///  so one expert may run here for one token and on the lane for another; slot is not read then)
 void group_experts(const int* ids, int T, int n_used, int n_exp, const uint8_t* base, size_t stride,
                    unsigned long long* grp_ptr, int* grp_start, int* grp_ent, int* n_groups, cudaStream_t s,
-                   const int* slot = nullptr, float* w = nullptr);
+                   const int* slot = nullptr, float* w = nullptr, const unsigned long long* eptr = nullptr,
+                   const int* who = nullptr);
 /// ... a token's alone (ds4_iq's plan form): plan[j] = base + ids[j] * stride
 void plan_experts(const int* ids, int n_used, const uint8_t* base, size_t stride, unsigned long long* plan,
-                  cudaStream_t s, const int* slot = nullptr, float* w = nullptr);
+                  cudaStream_t s, const int* slot = nullptr, float* w = nullptr,
+                  const unsigned long long* eptr = nullptr, const int* who = nullptr);
+
+/// The GPU fetch (a token window's routed experts that VRAM does not hold, computed by this GPU from a copy of the
+/// layer's experts in pinned RAM): one layer's device state and a GPU's scratch for it
+struct FetchLayer {
+    int* slot = nullptr;         // [n_exp] each expert's VRAM slot (-1: none) - the layer's slot table, kept current
+    int* owner = nullptr;        // [n_res] each slot's expert
+    float* score = nullptr;      // [n_exp] each expert's decayed picks (the cache's: a miss takes the slot of the
+                                 //  lowest scored expert not picked in the window when it scores higher)
+    const unsigned long long* hptr = nullptr;   // [n_exp] each expert's blob in pinned RAM, as this GPU addresses it
+    uint8_t* vram = nullptr;     // the layer's VRAM slots
+    size_t blob = 0;
+    int n_res = 0, n_exp = 0;
+};
+struct FetchScratch {
+    unsigned long long* eptr = nullptr;   // [n_exp] (out) the window's experts' blobs where this GPU reads them
+    int* who = nullptr;                   // [kMaxWin][16] (out) 1: the entry is the CPU lane's
+    unsigned long long *src = nullptr, *dst = nullptr;   // [kMaxWin x 16] (out) the copies to make, *nf of them
+    unsigned* nf = nullptr;
+    uint8_t* stage = nullptr;             // n_stage staging slots (blob apart) for misses the cache does not take
+    int n_stage = 0;
+    unsigned long long* stats = nullptr;  // [8] (summed) picks, VRAM hits, copied, read in place, the lane's, admitted
+};
+/// The window's picks resolved: k_gpu < 0 - every entry this GPU's (a miss copied into the slot of a colder expert
+/// when `cache`, else into a staging slot, else read in place); k_gpu >= 0 - the VRAM experts and each token's first
+/// k_gpu others (in pick order) this GPU's, copied into staging slots, the rest the CPU lane's (who); the slots kept
+/// (no cache).  decay: the scores' fading a token.  One block.
+/// ahead: the picks are a guess at a later layer's (its router on this layer's input) - only the misses the cache
+/// takes are listed (copied ahead of the layer), nothing else is written, the scores are left as they are
+void fetch_resolve(const int* ids, int T, int n_used, const FetchLayer& fl, const FetchScratch& fs, int k_gpu,
+                   bool cache, float decay, cudaStream_t s, bool ahead = false);
+/// The copies fetch_resolve listed (pinned RAM -> VRAM, blob bytes each) by `blocks` blocks
+void fetch_copy(const FetchScratch& fs, size_t blob, int blocks, cudaStream_t s);
 /// out[t] = sum_j w[t][j] part[t * 16 + j] (part rows of n; the plan form: part[j], T 1) - entries of weight 0 skipped
 void moe_sum(const float* part, int T, int n_used, int n, const float* w, float* out, cudaStream_t s);
 /// Duplicate each row: dst[2 r] = dst[2 r + 1] = src[r] (int8 rows of k with their scales: the grouped form's input
@@ -145,6 +207,11 @@ void ix_pool(const float* ivg, int ring, int g0, int n, int kpool, int dim, cons
 /// wt[t][h]; -inf beyond.  q [T][heads][dim], wt [T][heads]; score rows ld apart, n_pool columns
 void ix_score(const float* q, const float* wt, int T, int heads, int dim, const float* pooled, const int* pos, int kpool,
               int n_pool, float* score, size_t ld, cudaStream_t s, bool f16 = false);
+/// ... on an RDNA GPU's matrix cores (attn_wmma_on's devices; 16 heads of 128; HY4_IX_WMMA=0 off): the pools rounded
+/// to F16, the products of a split query, in another order - the prompt path past the exact span alone.  false: not
+/// taken (ix_score then)
+bool ix_score_wmma(const float* q, const float* wt, int T, int heads, int dim, const float* pooled, const int* pos,
+                   int kpool, int n_pool, float* score, size_t ld, cudaStream_t s, bool f16 = false);
 /// ... from the heads' dot products of a GEMM (the prompt path): S[(t heads + h) ldS + j] = q[t][h] . pk[g0 + j],
 /// j < n -> score[t][g0 + j] as ix_score's (the same sum over the heads; -inf from nv[t] on)
 void ix_reduce(const float* S, size_t ldS, const float* wt, int T, int heads, const int* pos, int kpool, int g0, int n,

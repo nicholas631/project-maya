@@ -3,6 +3,7 @@
 // (src/models/hy-v4-flash.cpp of their hy4-flash patch).
 #include "hy4_kernels.cuh"
 #include "strata/kernels/fresh_load.hpp"
+#include "strata/kernels/rdna_wmma.hpp"
 
 #include <cuda_fp16.h>
 
@@ -14,6 +15,7 @@
 #include <mutex>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 
 namespace hy4::k {
@@ -550,21 +552,35 @@ __global__ void rope_kernel(float* __restrict__ x, int nh, size_t ld, size_t ldt
 // ---------------------------------------------------------------- the latent cache
 // KV streaming: the row just written (words 32-bit words) into the host's row of its position as well, and the slot's
 // tag
-__device__ __forceinline__ void kv_mirror(const void* row, uint32_t* host_row, int words, int* tag, int slot, int p) {
+// (KV spill: the newest tier's slot p % hres, its last position's hidx dropped where it still names the slot)
+__device__ __forceinline__ void kv_mirror(const void* row, uint32_t* host, int words, int* tag, int slot, int p,
+                                          int* htag, int* hidx, int hres) {
     __syncthreads();
+    const size_t hs = hidx ? (size_t) (p % hres) : (size_t) p;
+    uint32_t* host_row = host + hs * (size_t) words;
     const uint32_t* src = (const uint32_t*) row;
     for (int i = threadIdx.x; i < words; i += blockDim.x) host_row[i] = src[i];
-    if (threadIdx.x == 0) tag[slot] = p;
+    if (threadIdx.x == 0) {
+        tag[slot] = p;
+        if (hidx) {
+            const int old = htag[hs];
+            if (old >= 0 && old != p && hidx[old] == (int) hs) hidx[old] = -1;
+            htag[hs] = p;
+            hidx[p] = (int) hs;
+        }
+    }
 }
 // a reader's row of position p: the VRAM ring's where its tag is p, else the host's
-__device__ __forceinline__ size_t kv_src(int p, int ring, const int* tag, bool& host) {
+// (KV spill: the host's row of p in slot hidx[p] - kv_need put it there before the read)
+__device__ __forceinline__ size_t kv_src(int p, int ring, const int* tag, const int* hidx, bool& host) {
     const int r = ring > 0 ? p % ring : p;
     host = tag != nullptr && tag[r] != p;
-    return host ? (size_t) p : (size_t) r;
+    return host ? (size_t) (hidx ? max(hidx[p], 0) : p) : (size_t) r;
 }
 __global__ void kv_store_kernel(const float* __restrict__ kv, int kv_lora, int n_rot, const float* __restrict__ w,
                                 float eps, const int* __restrict__ pos, float base, __half* __restrict__ cache,
-                                int ring, int* __restrict__ tag, uint32_t* __restrict__ host) {
+                                int ring, int* __restrict__ tag, uint32_t* __restrict__ host, int* htag, int* hidx,
+                                int hres) {
     const int t = blockIdx.x, row = kv_lora + n_rot;
     const float* x = kv + (size_t) t * row;
     const int p = pos[t];
@@ -581,7 +597,7 @@ __global__ void kv_store_kernel(const float* __restrict__ kv, int kv_lora, int n
         dst[kv_lora + 2 * i] = __float2half_rn(a);
         dst[kv_lora + 2 * i + 1] = __float2half_rn(b);
     }
-    if (tag) kv_mirror(dst, host + (size_t) p * (row / 2), row / 2, tag, slot, p);
+    if (tag) kv_mirror(dst, host, row / 2, tag, slot, p, htag, hidx, hres);
 }
 
 // ... in Q8_0 rows (kv_q8_row_bytes): the row's values staged in shared memory, then each block of 32 of the latent by
@@ -589,7 +605,8 @@ __global__ void kv_store_kernel(const float* __restrict__ kv, int kv_lora, int n
 // values the F16 kernel stores, before their F16 rounding); the rotated part as F16 after the scales
 __global__ void kv_store_q8_kernel(const float* __restrict__ kv, int kv_lora, int n_rot, const float* __restrict__ w,
                                    float eps, const int* __restrict__ pos, float base, uint8_t* __restrict__ cache,
-                                   int ring, int rb, int* __restrict__ tag, uint32_t* __restrict__ host) {
+                                   int ring, int rb, int* __restrict__ tag, uint32_t* __restrict__ host,
+                                   int* htag, int* hidx, int hres) {
     __shared__ float v[1024];
     const int t = blockIdx.x, row = kv_lora + n_rot;
     const float* x = kv + (size_t) t * row;
@@ -623,7 +640,7 @@ __global__ void kv_store_q8_kernel(const float* __restrict__ kv, int kv_lora, in
         if (lane == 0) sc[b] = dh;
     }
     for (int i = kv_lora + kv_lora / 16 + 2 * n_rot + threadIdx.x; i < rb; i += blockDim.x) dst[i] = 0;   // (its pad)
-    if (tag) kv_mirror(dst, host + (size_t) p * (rb / 4), rb / 4, tag, slot, p);
+    if (tag) kv_mirror(dst, host, rb / 4, tag, slot, p, htag, hidx, hres);
 }
 
 // ---------------------------------------------------------------- MLA attention over the latent cache
@@ -847,6 +864,200 @@ __global__ void __launch_bounds__(256) attn2_kernel(const float* __restrict__ q,
         o[2 + 2 * (lane + 32 * i) + 1] = acc[2 * i + 1];
     }
 }
+// ---------------------------------------------------------------- the same attention on an RDNA GPU's matrix cores
+// A prompt sub-batch's tokens over their picked keys (the indexed layers past the dense span), maya-ds4's WMMA pattern
+// (sparse_attn_wmma_kernel) on this cache's rows: grid (H / (16 G), T), 256 threads (8 warps) a group of 16 heads, G
+// groups a block over one token's keys - each tile of 16 rows staged once into shared memory as F16 for all G (a
+// thread's 16-byte loads of the next tile in flight under this tile's sums; Q8 rows dequantized as they are stored).
+// The dots: A = 16 heads' queries, B = the tile's 16 rows; warp w over the latent's dimensions w * 64 .. + 64 and, for
+// w < 4, the rotated part's 512 + 16 w .. + 16; the warps' parts summed in shared memory in warp order.  The query and
+// the probabilities split into an F16 high and a low part (two products each: ~22 bits of mantissa), the rows exact
+// in F16 - within rounding of attn_kernel's F32 sums, in another order.  Then a thread a (head, row): the online
+// softmax; warp w's output dimensions w * 64 .. + 64; the sink and the division at the end (attn_combine's sums, in
+// one pass: no partial results).  Only past the dense span on the prompt path: every token window - decode, a draft's
+// verify - keeps attn_kernel's own sums.
+constexpr int kWR = 16, kWDS = 576 + 8;   // (the tile's rows; a row's stride in F16 values: 16-byte reads on other banks)
+// (AMD: registers for 8 waves a SIMD - two blocks of 512 threads a WGP rather than one at the 200 the compiler takes
+//  on its own: the kernel waits on its loads and barriers, so the second block hides them)
+#if defined(STRATA_USE_HIP)
+#define HY4_WMMA_OCC __attribute__((amdgpu_waves_per_eu(8)))
+#else
+#define HY4_WMMA_OCC
+#endif
+template <bool Q8, int G>
+__global__ void __launch_bounds__(256 * G) HY4_WMMA_OCC attn_wmma_kernel(const float* __restrict__ q, int H,
+                                                           const void* __restrict__ cache_v, int ring,
+                                                           const int* __restrict__ keys, int ldk,
+                                                           const int* __restrict__ nk, float scale,
+                                                           const float* __restrict__ sinks, float* __restrict__ out,
+                                                           int rb) {
+#if defined(MAYA_RDNA_WMMA)
+    using namespace maya::kernels;
+    constexpr int NT = 256 * G, NQ = (kWR * 72 + NT - 1) / NT;   // (a tile: 16 rows x 72 16-byte words)
+    constexpr int PS = kWR + 4;
+    const int g = G == 1 ? 0 : (int) (threadIdx.x >> 8), lt = (int) (threadIdx.x & 255);
+    const int hb = (blockIdx.x * G + g) * 16, t = blockIdx.y;
+    const int n = nk[t];
+    const int* kt = keys + (size_t) t * ldk;
+    __shared__ __align__(16) _Float16 tile[kWR * kWDS];
+    __shared__ float sp_[G][8][kWR * kWR];
+    __shared__ float pr_[G][16 * PS];
+    __shared__ float m_run_[G][16], den_[G][16], tsc_[G][16];
+    float(*sp)[kWR * kWR] = sp_[g];
+    float* pr = pr_[g];
+    float *m_run = m_run_[g], *den = den_[g], *tsc = tsc_[g];
+    const int lane = lt & 31, wp = lt >> 5, m16 = lane & 15, hi = lane >> 4;
+    const int nkk = wp < 4 ? 5 : 4;   // (k-steps: the latent's 4, the rotated part's 1 for warps 0 .. 3)
+    wmma_h16 qa[5], qb[5];
+    {
+        const float* qh = q + ((size_t) t * H + hb + m16) * 576;
+#pragma unroll
+        for (int kk = 0; kk < 5; ++kk) {
+            const int d0 = kk < 4 ? wp * 64 + kk * 16 : 512 + wp * 16;
+#pragma unroll
+            for (int e = 0; e < 16; ++e) {
+                const float v = kk < nkk ? qh[d0 + e] : 0.0f;
+                const _Float16 h = (_Float16) v;
+                qa[kk][e] = h;
+                qb[kk][e] = (_Float16) (v - (float) h);
+            }
+        }
+    }
+    if (lt < 16) {
+        m_run[lt] = -1e30f;
+        den[lt] = 0.0f;
+    }
+    lds_sync();
+    wmma_f8 acc[4];
+#pragma unroll
+    for (int nt = 0; nt < 4; ++nt) acc[nt] = wmma_f8{};
+    // the staging: word i of the tile (row i / 72, 16-byte word i % 72 of it) - thread x's words x, x + NT, ..
+    uint4 nx[NQ];
+    auto fetch = [&](int f0) {
+#pragma unroll
+        for (int k = 0; k < NQ; ++k) {
+            const int i = (int) threadIdx.x + k * NT, r = i / 72, w = i % 72;
+            if (i >= kWR * 72 || f0 + r >= n) continue;
+            const int p = kt[f0 + r], row = ring > 0 ? p % ring : p;
+            if (!Q8) {
+                nx[k] = ((const uint4*) cache_v)[(size_t) row * 72 + w];
+            } else {
+                const uint8_t* rp = (const uint8_t*) cache_v + (size_t) row * rb;
+                if (w < 64) {   // (8 int8 values and their block's scale)
+                    const uint2 b = *(const uint2*) (rp + 8 * w);
+                    nx[k].x = b.x;
+                    nx[k].y = b.y;
+                    nx[k].z = *(const uint16_t*) (rp + 512 + 2 * (w >> 2));
+                } else {
+                    nx[k] = *(const uint4*) (rp + 544 + 16 * (w - 64));
+                }
+            }
+        }
+    };
+    auto stage = [&](int f0) {
+#pragma unroll
+        for (int k = 0; k < NQ; ++k) {
+            const int i = (int) threadIdx.x + k * NT, r = i / 72, w = i % 72;
+            if (i >= kWR * 72) continue;
+            uint4* dst = (uint4*) (tile + r * kWDS) + w;
+            if (f0 + r >= n) {
+                *dst = make_uint4(0u, 0u, 0u, 0u);
+            } else if (!Q8 || w >= 64) {
+                *dst = nx[k];
+            } else {   // (attn_kernel's dequantization: d * q rounded to F16)
+                const float d = (float) __builtin_bit_cast(_Float16, (unsigned short) nx[k].z);
+                const uint32_t b[2] = {nx[k].x, nx[k].y};
+                _Float16 o[8];
+#pragma unroll
+                for (int j = 0; j < 8; ++j) o[j] = (_Float16) (d * (float) (int8_t) ((b[j >> 2] >> (8 * (j & 3))) & 0xff));
+                *dst = *(const uint4*) o;
+            }
+        }
+    };
+    fetch(0);
+    for (int t0 = 0; t0 < n; t0 += kWR) {
+        const int nr = min(kWR, n - t0);
+        stage(t0);   // (this tile's readers before: done at the loop's last barrier)
+        lds_sync();
+        if (t0 + kWR < n) fetch(t0 + kWR);
+        wmma_f8 s = {};
+#pragma unroll
+        for (int kk = 0; kk < 5; ++kk) {   // B: row m16, the k-step's 16 dimensions
+            if (kk >= nkk) break;
+            const int d0 = kk < 4 ? wp * 64 + kk * 16 : 512 + wp * 16;
+            const uint4* kr = (const uint4*) (tile + m16 * kWDS + d0);
+            const uint4 x0 = kr[0], x1 = kr[1];
+            wmma_h16 kb;
+            const uint32_t w8[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                kb[2 * e] = __builtin_bit_cast(_Float16, (unsigned short) (w8[e] & 0xffffu));
+                kb[2 * e + 1] = __builtin_bit_cast(_Float16, (unsigned short) (w8[e] >> 16));
+            }
+            s = wmma_f16(qa[kk], kb, s);
+            s = wmma_f16(qb[kk], kb, s);
+        }
+#pragma unroll
+        for (int i = 0; i < 8; ++i) sp[wp][wmma_row(i, hi) * kWR + m16] = s[i];
+        lds_sync();
+        {   // thread (head lt / 16, row lt % 16): the tile's score, the head's running max and denominator
+            const int h = lt >> 4, r = lt & 15;
+            float v = 0.0f;
+#pragma unroll
+            for (int w = 0; w < 8; ++w) v += sp[w][lt];
+            v = r < nr ? v * scale : -INFINITY;
+            float mx = v;
+#pragma unroll
+            for (int k = 8; k >= 1; k >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, k));
+            const float m_old = m_run[h], m_new = fmaxf(m_old, mx);
+            const float p = r < nr ? expf(v - m_new) : 0.0f;
+            float sum = p;
+#pragma unroll
+            for (int k = 8; k >= 1; k >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, k);
+            pr[h * PS + r] = p;
+            if (r == 0) {   // (the head's 16 lanes read m_run above, in this same instruction stream)
+                const float ts = expf(m_old - m_new);
+                tsc[h] = ts;
+                den[h] = den[h] * ts + sum;
+                m_run[h] = m_new;
+            }
+        }
+        lds_sync();
+        wmma_h16 pa, pb;   // A of the weighted sums: head m16's probabilities of the tile's rows
+#pragma unroll
+        for (int r = 0; r < kWR; ++r) {
+            const float p = pr[m16 * PS + r];
+            const _Float16 h = (_Float16) p;
+            pa[r] = h;
+            pb[r] = (_Float16) (p - (float) h);
+        }
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {   // B: output dimension wp * 64 + nt * 16 + m16 of the tile's rows
+#pragma unroll
+            for (int i = 0; i < 8; ++i) acc[nt][i] *= tsc[wmma_row(i, hi)];
+            const _Float16* vc = tile + wp * 64 + nt * 16 + m16;
+            wmma_h16 vb;
+#pragma unroll
+            for (int r = 0; r < kWR; ++r) vb[r] = vc[r * kWDS];
+            acc[nt] = wmma_f16(pa, vb, acc[nt]);
+            acc[nt] = wmma_f16(pb, vb, acc[nt]);
+        }
+        lds_sync();
+    }
+#pragma unroll
+    for (int nt = 0; nt < 4; ++nt)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int h = wmma_row(i, hi);   // (attn_combine's: the largest of the sink and the scores the base)
+            const float mr = m_run[h], M = sinks ? fmaxf(mr, sinks[hb + h]) : mr, f = expf(mr - M);
+            const float dn = den[h] * f + (sinks ? expf(sinks[hb + h] - M) : 0.0f);
+            out[((size_t) t * H + hb + h) * 512 + wp * 64 + nt * 16 + m16] = dn > 0.0f ? acc[nt][i] * f / dn : 0.0f;
+        }
+#else
+    (void) q, (void) H, (void) cache_v, (void) ring, (void) keys, (void) ldk, (void) nk, (void) scale, (void) sinks;
+    (void) out, (void) rb;
+#endif
+}
 // a block a (t, head): the chunks merged with the sink, 512 threads (a value dim each)
 __global__ void attn_combine_kernel(int H, int nchunk, int kc, const int* __restrict__ nk,
                                     const float* __restrict__ sinks, const float* __restrict__ ws,
@@ -1045,22 +1256,25 @@ __global__ void __launch_bounds__(512) router_bitonic_kernel(const float* __rest
 // one thread (a window has at most 16 x 16 entries): counting sort of the entries by expert
 __global__ void group_kernel(const int* __restrict__ ids, int T, int n_used, int n_exp, const uint8_t* base,
                              size_t stride, unsigned long long* grp_ptr, int* grp_start, int* grp_ent, int* n_groups,
-                             const int* __restrict__ slot, float* __restrict__ w) {
+                             const int* __restrict__ slot, float* __restrict__ w,
+                             const unsigned long long* __restrict__ eptr, const int* __restrict__ who) {
     __shared__ int cnt[1024], at[1024];
+    // (an entry left out: the CPU lane's - who's flag, else no blob in eptr, else no slot)
+    auto out_of = [&](int i, int e) { return who ? who[i] != 0 : eptr ? eptr[e] == 0ull : slot && slot[e] < 0; };
     for (int e = threadIdx.x; e < n_exp; e += blockDim.x) cnt[e] = 0;
     __syncthreads();
     if (threadIdx.x != 0) return;
     for (int t = 0; t < T; ++t)
         for (int j = 0; j < n_used; ++j) {
             const int e = ids[t * n_used + j];
-            if (slot && slot[e] < 0) w[t * n_used + j] = 0.0f;   // (the CPU lane's)
+            if (out_of(t * n_used + j, e)) w[t * n_used + j] = 0.0f;   // (the CPU lane's)
             else ++cnt[e];
         }
     int g = 0, off = 0;
     for (int e = 0; e < n_exp; ++e) {
         at[e] = off;
         if (cnt[e]) {
-            grp_ptr[g] = (unsigned long long) (base + (size_t) (slot ? slot[e] : e) * stride);
+            grp_ptr[g] = eptr ? eptr[e] : (unsigned long long) (base + (size_t) (slot ? slot[e] : e) * stride);
             grp_start[g] = off;
             ++g;
             off += cnt[e];
@@ -1071,7 +1285,7 @@ __global__ void group_kernel(const int* __restrict__ ids, int T, int n_used, int
     for (int t = 0; t < T; ++t)
         for (int j = 0; j < n_used; ++j) {
             const int e = ids[t * n_used + j];
-            if (!slot || slot[e] >= 0) grp_ent[at[e]++] = t * 16 + j;
+            if (!out_of(t * n_used + j, e)) grp_ent[at[e]++] = t * 16 + j;
         }
 }
 // ... the same groups and the same entry order (by expert, then t 16 + j), a thread an expert: the window's entries
@@ -1081,13 +1295,15 @@ __global__ void __launch_bounds__(1024) group_par_kernel(const int* __restrict__
                                                          const uint8_t* base, size_t stride,
                                                          unsigned long long* grp_ptr, int* grp_start, int* grp_ent,
                                                          int* n_groups, const int* __restrict__ slot,
-                                                         float* __restrict__ w) {
+                                                         float* __restrict__ w,
+                                                         const unsigned long long* __restrict__ eptr,
+                                                         const int* __restrict__ who) {
     __shared__ int ent[16 * 16];
     __shared__ int sc[1024], sg[1024];
     const int e = threadIdx.x, n_ent = T * n_used;
     for (int i = threadIdx.x; i < n_ent; i += blockDim.x) {
         const int x = ids[i];
-        const bool out = slot && slot[x] < 0;
+        const bool out = who ? who[i] != 0 : eptr ? eptr[x] == 0ull : slot && slot[x] < 0;
         if (out) w[i] = 0.0f;   // (not this GPU's)
         ent[i] = out ? -1 : x;
     }
@@ -1108,7 +1324,7 @@ __global__ void __launch_bounds__(1024) group_par_kernel(const int* __restrict__
     }
     const int off = sc[e] - c, gi = sg[e] - (c > 0);
     if (e < n_exp && c > 0) {
-        grp_ptr[gi] = (unsigned long long) (base + (size_t) (slot ? slot[e] : e) * stride);
+        grp_ptr[gi] = eptr ? eptr[e] : (unsigned long long) (base + (size_t) (slot ? slot[e] : e) * stride);
         grp_start[gi] = off;
         int k = off;
         for (int i = 0; i < n_ent; ++i)
@@ -1122,9 +1338,16 @@ __global__ void __launch_bounds__(1024) group_par_kernel(const int* __restrict__
     }
 }
 __global__ void plan_kernel(const int* ids, int n_used, const uint8_t* base, size_t stride, unsigned long long* plan,
-                            const int* __restrict__ slot, float* __restrict__ w) {
+                            const int* __restrict__ slot, float* __restrict__ w,
+                            const unsigned long long* __restrict__ eptr, const int* __restrict__ who) {
     const int j = threadIdx.x;
     if (j >= n_used) return;
+    if (eptr) {   // (the GPU fetch: the blob where it lies, or the CPU lane's)
+        const unsigned long long p = who && who[j] != 0 ? 0ull : eptr[ids[j]];
+        plan[j] = p;
+        if (p == 0ull) w[j] = 0.0f;
+        return;
+    }
     const int s = slot ? slot[ids[j]] : ids[j];
     plan[j] = s >= 0 ? (unsigned long long) (base + (size_t) s * stride) : 0ull;   // (0: the CPU lane's)
     if (s < 0) w[j] = 0.0f;
@@ -1263,7 +1486,8 @@ __global__ void __launch_bounds__(1024) ix_union_kernel(const int* __restrict__ 
 // (list: row j the position list[j / kpool] kpool + j % kpool - a list of pools' rows; zeros from position kend on)
 __global__ void kv_deq_kernel(const uint8_t* __restrict__ cache, int ring, int kv_lora, int n_rot, int rb, int k0, int n,
                               __half2* __restrict__ dst, const int* __restrict__ list, int kpool,
-                              int kend, const int* __restrict__ tag, const uint8_t* __restrict__ host) {
+                              int kend, const int* __restrict__ tag, const uint8_t* __restrict__ host,
+                              const int* __restrict__ hidx) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
     const int half_row = (kv_lora + n_rot) / 2;
     if (i >= (size_t) n * half_row) return;
@@ -1274,7 +1498,7 @@ __global__ void kv_deq_kernel(const uint8_t* __restrict__ cache, int ring, int k
         return;
     }
     bool fh = false;
-    const size_t r = kv_src(q, ring, tag, fh);
+    const size_t r = kv_src(q, ring, tag, hidx, fh);
     const uint8_t* rp = (fh ? host : cache) + r * rb;
     if (2 * c < kv_lora) {
         const char2 qv = *(const char2*) (rp + 2 * c);
@@ -1286,7 +1510,8 @@ __global__ void kv_deq_kernel(const uint8_t* __restrict__ cache, int ring, int k
 }
 __global__ void kv_gather_kernel(const uint4* __restrict__ cache, int ring, int row16, int k0, int n,
                                  uint4* __restrict__ dst, const int* __restrict__ list, int kpool,
-                                 int kend, const int* __restrict__ tag, const uint4* __restrict__ host) {
+                                 int kend, const int* __restrict__ tag, const uint4* __restrict__ host,
+                                 const int* __restrict__ hidx) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (size_t) n * row16) return;
     const int j = (int) (i / row16), c = (int) (i % row16);
@@ -1296,19 +1521,20 @@ __global__ void kv_gather_kernel(const uint4* __restrict__ cache, int ring, int 
         return;
     }
     bool fh = false;
-    const size_t r = kv_src(q, ring, tag, fh);
+    const size_t r = kv_src(q, ring, tag, hidx, fh);
     dst[i] = (fh ? host : cache)[r * row16 + c];
 }
 // a block row a token: its picked rows (row16 uint4s each) side by side
 __global__ void kv_pick_kernel(const uint4* __restrict__ cache, int ring, int row16, const int* __restrict__ keys,
                                int ldk, const int* __restrict__ nk, uint4* __restrict__ dst,
-                               const int* __restrict__ tag, const uint4* __restrict__ host) {
+                               const int* __restrict__ tag, const uint4* __restrict__ host,
+                               const int* __restrict__ hidx) {
     const int t = blockIdx.y;
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
     const int j = (int) (i / row16), c = (int) (i % row16);
     if (j >= nk[t]) return;
     bool fh = false;
-    const size_t r = kv_src(keys[(size_t) t * ldk + j], ring, tag, fh);
+    const size_t r = kv_src(keys[(size_t) t * ldk + j], ring, tag, hidx, fh);
     dst[((size_t) t * ldk + j) * row16 + c] = (fh ? host : cache)[r * row16 + c];
 }
 
@@ -1678,6 +1904,101 @@ __global__ void __launch_bounds__(256) ix_score_kernel(const float* __restrict__
     }
     score[(size_t) t * ld + g] = out;
 }
+// The same scores on an RDNA GPU's matrix cores (16 heads of 128 dimensions): maya-ds4's WMMA indexer pattern on these
+// pools - a warp a token, its 16 heads' query split into an F16 high and a low part held as A (8 k-steps); the pools
+// in tiles of 64 staged into shared memory as F16 for the block's 8 tokens (the next tile's loads in flight under this
+// one's products), B = 16 of them; a lane's 8 heads' products of its pool, relu, the head weights, the other half of
+// the wave's 8 (lane ^ 16).  Grid (ceil(n_pool / kIxPB), ceil(T / 8)).  The pools rounded to F16 (an 8-bit cache's are
+// F16 already), the sums in another order: past ix_gemm_from on the prompt path alone (as ix_gemm's GEMMs).
+constexpr int kIxTile = 64, kIxPB = 512, kIxLD = 128 + 8;
+template <typename P>
+__global__ void __launch_bounds__(256) ix_score_wmma_kernel(const float* __restrict__ q, const float* __restrict__ wt,
+                                                            int T, const P* __restrict__ pooled,
+                                                            const int* __restrict__ pos, int kpool, int n_pool,
+                                                            float* __restrict__ score, size_t ld) {
+#if defined(MAYA_RDNA_WMMA)
+    using namespace maya::kernels;
+    __shared__ __align__(16) _Float16 ks[kIxTile * kIxLD];
+    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5, m16 = lane & 15, hi = lane >> 4;
+    const int t = blockIdx.y * 8 + wp, g0 = blockIdx.x * kIxPB, g1 = min(n_pool, g0 + kIxPB);
+    const bool live = t < T;
+    const int nv = live ? pos[t] / kpool : 0;
+    wmma_h16 qa[8], qb[8];
+    float w8[8];
+    if (live) {
+        const float* qh = q + ((size_t) t * 16 + m16) * 128;
+#pragma unroll
+        for (int kk = 0; kk < 8; ++kk)
+#pragma unroll
+            for (int e = 0; e < 16; ++e) {
+                const float v = qh[kk * 16 + e];
+                const _Float16 h = (_Float16) v;
+                qa[kk][e] = h;
+                qb[kk][e] = (_Float16) (v - (float) h);
+            }
+#pragma unroll
+        for (int i = 0; i < 8; ++i) w8[i] = wt[(size_t) t * 16 + wmma_row(i, hi)];
+    }
+    // the staging: a tile's 64 pools x 16 groups of 8 values - thread x's groups x, x + 256, x + 512, x + 768
+    float4 nx[4][2];
+    auto fetch = [&](int f0) {
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int i = (int) threadIdx.x + 256 * k, r = i >> 4, c = i & 15;
+            if (f0 + r < g1) pooled8(pooled + (size_t) (f0 + r) * 128, 2 * c, nx[k][0], nx[k][1]);
+            else nx[k][0] = nx[k][1] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+    };
+    auto stage = [&]() {
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int i = (int) threadIdx.x + 256 * k, r = i >> 4, c = i & 15;
+            const float v[8] = {nx[k][0].x, nx[k][0].y, nx[k][0].z, nx[k][0].w,
+                                nx[k][1].x, nx[k][1].y, nx[k][1].z, nx[k][1].w};
+            _Float16 o[8];
+#pragma unroll
+            for (int e = 0; e < 8; ++e) o[e] = (_Float16) v[e];
+            *(uint4*) (ks + r * kIxLD + 8 * c) = *(const uint4*) o;
+        }
+    };
+    fetch(g0);
+    for (int f0 = g0; f0 < g1; f0 += kIxTile) {
+        stage();
+        lds_sync();
+        if (f0 + kIxTile < g1) fetch(f0 + kIxTile);
+        if (live) {
+#pragma unroll
+            for (int sub = 0; sub < kIxTile / 16; ++sub) {
+                const int g = f0 + sub * 16 + m16;
+                if (f0 + sub * 16 >= g1) break;
+                wmma_f8 c = {};
+#pragma unroll
+                for (int kk = 0; kk < 8; ++kk) {   // B: pool g's dimensions kk * 16 .. + 15
+                    const uint4* kr = (const uint4*) (ks + (sub * 16 + m16) * kIxLD + kk * 16);
+                    const uint4 x0 = kr[0], x1 = kr[1];
+                    const uint32_t u[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+                    wmma_h16 kb;
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) {
+                        kb[2 * e] = __builtin_bit_cast(_Float16, (unsigned short) (u[e] & 0xffffu));
+                        kb[2 * e + 1] = __builtin_bit_cast(_Float16, (unsigned short) (u[e] >> 16));
+                    }
+                    c = wmma_f16(qa[kk], kb, c);
+                    c = wmma_f16(qb[kk], kb, c);
+                }
+                float s = 0.0f;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) s = fmaf(fmaxf(c[i], 0.0f), w8[i], s);
+                s += __shfl_xor_sync(0xffffffffu, s, 16);
+                if (hi == 0 && g < g1) score[(size_t) t * ld + g] = g < nv ? s : -INFINITY;
+            }
+        }
+        lds_sync();
+    }
+#else
+    (void) q, (void) wt, (void) T, (void) pooled, (void) pos, (void) kpool, (void) n_pool, (void) score, (void) ld;
+#endif
+}
 // The scores from the heads' dot products a GEMM left in S (column (t, h), row g - g0; ldS apart): grid
 // (ceil(n / 256), T), a thread a pool - the heads summed in ix_score_kernel's order
 __global__ void ix_reduce_kernel(const float* __restrict__ S, size_t ldS, const float* __restrict__ wt, int heads,
@@ -1959,10 +2280,11 @@ void kv_store(const float* kv, int T, int kv_lora, int n_rot, const float* w, fl
     }
     if (q8)
         kv_store_q8_kernel<<<T, 256, 0, s>>>(kv, kv_lora, n_rot, w, eps, pos, base, (uint8_t*) cache, ring,
-                                             (int) kv_q8_row_bytes(kv_lora, n_rot), hs.tag, (uint32_t*) hs.rows);
+                                             (int) kv_q8_row_bytes(kv_lora, n_rot), hs.tag, (uint32_t*) hs.rows,
+                                             hs.htag, hs.hidx, hs.hres);
     else
         kv_store_kernel<<<T, 256, 0, s>>>(kv, kv_lora, n_rot, w, eps, pos, base, (__half*) cache, ring, hs.tag,
-                                          (uint32_t*) hs.rows);
+                                          (uint32_t*) hs.rows, hs.htag, hs.hidx, hs.hres);
     check("kv_store");
 }
 size_t attn_ws_floats(int T, int H, int kv_lora, int max_keys) {
@@ -2019,6 +2341,46 @@ void attention(const float* q, int T, int H, int kv_lora, int n_rot, const uint1
     attn_combine_kernel<<<dim3((unsigned) H, (unsigned) T), 512, 0, s>>>(H, nchunk, kc, nk, sinks, ws, out);
     check("attn_combine");
 }
+bool attn_wmma_on() {
+#if defined(STRATA_USE_HIP)
+    // (the device's arch once a device: gfx11 - RDNA 3 / 3.5 - by default; gfx12 only with HY4_ATTN_WMMA=1, not
+    //  measured there; HY4_ATTN_WMMA=0 off everywhere)
+    static const int env = std::getenv("HY4_ATTN_WMMA") ? std::atoi(std::getenv("HY4_ATTN_WMMA")) : -1;
+    static std::atomic<int> known[64];   // 0: not asked yet, 1: no, 2: yes
+    int dev = 0;
+    if (env == 0 || cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+    int v = known[dev].load(std::memory_order_relaxed);
+    if (v == 0) {
+        cudaDeviceProp p{};
+        const bool ok = cudaGetDeviceProperties(&p, dev) == cudaSuccess;
+        v = ok && (std::strncmp(p.gcnArchName, "gfx11", 5) == 0 ||
+                   (env == 1 && std::strncmp(p.gcnArchName, "gfx12", 5) == 0)) ? 2 : 1;
+        known[dev].store(v, std::memory_order_relaxed);
+    }
+    return v == 2;
+#else
+    return false;
+#endif
+}
+bool attention_wmma(const float* q, int T, int H, int kv_lora, int n_rot, const uint16_t* cache, int ring,
+                    const int* keys, int ldk, const int* nk, float scale, const float* sinks, float* out,
+                    cudaStream_t s, bool q8) {
+    if (T <= 0 || kv_lora != 512 || n_rot != 64 || keys == nullptr || H % 16 != 0 || !attn_wmma_on()) return false;
+    // G: the groups of 16 heads a block sharing a staged tile - 2 where the heads come in 32s (HY4_ATTN_WMMA_G=1: one)
+    static const int g1 = std::getenv("HY4_ATTN_WMMA_G") ? std::atoi(std::getenv("HY4_ATTN_WMMA_G")) : 0;
+    const int G = H % 32 == 0 && g1 != 1 ? 2 : 1;
+    const int rb = q8 ? (int) kv_q8_row_bytes(kv_lora, n_rot) : 0;
+    const dim3 grid((unsigned) (H / (16 * G)), (unsigned) T);
+    if (G == 2) {
+        if (q8) attn_wmma_kernel<true, 2><<<grid, 512, 0, s>>>(q, H, cache, ring, keys, ldk, nk, scale, sinks, out, rb);
+        else attn_wmma_kernel<false, 2><<<grid, 512, 0, s>>>(q, H, cache, ring, keys, ldk, nk, scale, sinks, out, rb);
+    } else {
+        if (q8) attn_wmma_kernel<true, 1><<<grid, 256, 0, s>>>(q, H, cache, ring, keys, ldk, nk, scale, sinks, out, rb);
+        else attn_wmma_kernel<false, 1><<<grid, 256, 0, s>>>(q, H, cache, ring, keys, ldk, nk, scale, sinks, out, rb);
+    }
+    check("attention_wmma");
+    return true;
+}
 void sigmoid_mul(float* x, const float* g, size_t n, cudaStream_t s) {
     sigmoid_mul_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(x, g, n);
     check("sigmoid_mul");
@@ -2057,19 +2419,146 @@ void router(const float* logits, int T, int n_exp, const float* bias, int n_used
 }
 void group_experts(const int* ids, int T, int n_used, int n_exp, const uint8_t* base, size_t stride,
                    unsigned long long* grp_ptr, int* grp_start, int* grp_ent, int* n_groups, cudaStream_t s,
-                   const int* slot, float* w) {
+                   const int* slot, float* w, const unsigned long long* eptr, const int* who) {
     static const bool serial = std::getenv("HY4_GROUP_SERIAL") != nullptr;   // (the earlier one-thread sort)
     if (!serial && n_exp <= 1024)
         group_par_kernel<<<1, 1024, 0, s>>>(ids, T, n_used, n_exp, base, stride, grp_ptr, grp_start, grp_ent, n_groups,
-                                            slot, w);
+                                            slot, w, eptr, who);
     else
-        group_kernel<<<1, 256, 0, s>>>(ids, T, n_used, n_exp, base, stride, grp_ptr, grp_start, grp_ent, n_groups, slot, w);
+        group_kernel<<<1, 256, 0, s>>>(ids, T, n_used, n_exp, base, stride, grp_ptr, grp_start, grp_ent, n_groups, slot, w,
+                                       eptr, who);
     check("group_experts");
 }
 void plan_experts(const int* ids, int n_used, const uint8_t* base, size_t stride, unsigned long long* plan,
-                  cudaStream_t s, const int* slot, float* w) {
-    plan_kernel<<<1, 32, 0, s>>>(ids, n_used, base, stride, plan, slot, w);
+                  cudaStream_t s, const int* slot, float* w, const unsigned long long* eptr, const int* who) {
+    plan_kernel<<<1, 32, 0, s>>>(ids, n_used, base, stride, plan, slot, w, eptr, who);
     check("plan_experts");
+}
+// One block of 1024 threads (n_exp <= 1024, T n_used <= 256): see fetch_resolve.  Every choice is a function of the
+// window's picks and the layer's state alone (ranks by score with the expert's number breaking ties; the staging slot a
+// miss lands in may vary from run to run, where it lies does not change what is computed)
+__global__ void __launch_bounds__(1024) fetch_resolve_kernel(const int* __restrict__ ids, int T, int n_used,
+                                                             FetchLayer fl, FetchScratch fs, int k_gpu, int cache,
+                                                             float decay, int ahead) {
+    __shared__ int ent[kMaxWin * 16];
+    __shared__ int cnt[1024], miss_e[kMaxWin * 16], vict_e[kMaxWin * 16];
+    __shared__ float sc[1024];
+    __shared__ unsigned char gpu_e[1024], kind[1024];   // kind: 1 a miss, 2 a victim candidate
+    __shared__ int n_miss, n_vict, n_fetch, n_stage, n_hit, n_lane, n_zc, n_adm;
+    const int tid = threadIdx.x, n_ent = T * n_used, n_exp = fl.n_exp;
+    if (tid == 0) n_miss = n_vict = n_fetch = n_stage = n_hit = n_lane = n_zc = n_adm = 0;
+    for (int i = tid; i < n_ent; i += blockDim.x) ent[i] = ids[i];
+    if (tid < n_exp) {
+        cnt[tid] = 0;
+        gpu_e[tid] = 0;
+    }
+    __syncthreads();
+    if (tid < T) {   // (a token's entries in pick order: its VRAM ones, then its first k_gpu others, this GPU's)
+        int g = 0, hit = 0, lane = 0;
+        for (int j = 0; j < n_used; ++j) {
+            const int i = tid * n_used + j, e = ent[i];
+            const bool res = fl.slot[e] >= 0;
+            const bool mine = res || k_gpu < 0 || g < k_gpu;
+            if (!res && mine) ++g;
+            if (!ahead) fs.who[i] = mine ? 0 : 1;
+            if (mine) gpu_e[e] = 1;
+            hit += res;
+            lane += !mine;
+            atomicAdd(&cnt[e], 1);
+        }
+        atomicAdd(&n_hit, hit);
+        atomicAdd(&n_lane, lane);
+    }
+    __syncthreads();
+    if (tid < n_exp) {
+        const int s = fl.slot[tid];
+        float v = 0.0f;
+        if (cache) {
+            v = fl.score[tid] * powf(decay, (float) T) + (float) cnt[tid];
+            if (!ahead) fl.score[tid] = v;   // (a guess weighs as the picks would, and is not counted)
+        }
+        sc[tid] = v;
+        kind[tid] = gpu_e[tid] && s < 0 ? 1 : cache && s >= 0 && cnt[tid] == 0 ? 2 : 0;
+    }
+    __syncthreads();
+    if (tid < n_exp && kind[tid] != 0) {   // ranks: the misses by score down, the victims by score up
+        const float v = sc[tid];
+        const bool m = kind[tid] == 1;
+        int r = 0;
+        for (int e = 0; e < n_exp; ++e)
+            if (kind[e] == kind[tid] && (m ? (sc[e] > v || (sc[e] == v && e < tid)) : (sc[e] < v || (sc[e] == v && e < tid))))
+                ++r;
+        if (m) {
+            miss_e[r] = tid;   // (r < n_ent: at most a miss an entry)
+            atomicAdd(&n_miss, 1);
+        } else {
+            if (r < kMaxWin * 16) vict_e[r] = tid;
+            atomicAdd(&n_vict, 1);
+        }
+    }
+    __syncthreads();
+    if (tid < n_miss) {   // miss r against victim r: the cache takes it when it scores higher (no admission past one
+                          //  that does not - the misses' scores fall as the victims' rise)
+        const int m = miss_e[tid];
+        unsigned long long dst = 0ull;
+        if (cache && tid < n_vict && tid < kMaxWin * 16 && sc[m] > sc[vict_e[tid]]) {
+            const int v = vict_e[tid], sl = fl.slot[v];
+            fl.slot[v] = -1;
+            fl.slot[m] = sl;
+            fl.owner[sl] = m;
+            dst = (unsigned long long) (fl.vram + (size_t) sl * fl.blob);
+            atomicAdd(&n_adm, 1);
+        } else if (!ahead) {   // (a guess the cache does not take: not copied)
+            const int k = atomicAdd(&n_stage, 1);
+            if (k < fs.n_stage) dst = (unsigned long long) (fs.stage + (size_t) k * fl.blob);
+        }
+        if (dst != 0ull) {
+            const int f = atomicAdd(&n_fetch, 1);
+            fs.src[f] = fl.hptr[m];
+            fs.dst[f] = dst;
+            if (!ahead) fs.eptr[m] = dst;
+        } else if (!ahead) {
+            fs.eptr[m] = fl.hptr[m];   // (no slot left: the kernels read it where it lies)
+            atomicAdd(&n_zc, 1);
+        }
+    }
+    __syncthreads();
+    if (!ahead && tid < n_exp && kind[tid] != 1) {
+        const int s = fl.slot[tid];
+        fs.eptr[tid] = gpu_e[tid] && s >= 0 ? (unsigned long long) (fl.vram + (size_t) s * fl.blob) : 0ull;
+    }
+    if (tid == 0) {
+        *fs.nf = (unsigned) n_fetch;
+        if (fs.stats) {
+            atomicAdd(&fs.stats[0], (unsigned long long) n_ent);
+            atomicAdd(&fs.stats[1], (unsigned long long) n_hit);
+            atomicAdd(&fs.stats[2], (unsigned long long) n_fetch);
+            atomicAdd(&fs.stats[3], (unsigned long long) n_zc);
+            atomicAdd(&fs.stats[4], (unsigned long long) n_lane);
+            atomicAdd(&fs.stats[5], (unsigned long long) n_adm);
+        }
+    }
+}
+// the listed copies one after another, each by the whole grid in 16-byte words (pinned RAM read over the bus)
+__global__ void __launch_bounds__(256) fetch_copy_kernel(const unsigned long long* __restrict__ src,
+                                                         const unsigned long long* __restrict__ dst,
+                                                         const unsigned* __restrict__ nf, size_t n16) {
+    const unsigned n = *nf;
+    const size_t step = (size_t) gridDim.x * blockDim.x;
+    for (unsigned f = 0; f < n; ++f) {
+        const uint4* a = (const uint4*) src[f];
+        uint4* b = (uint4*) dst[f];
+        for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n16; i += step) b[i] = a[i];
+    }
+}
+void fetch_resolve(const int* ids, int T, int n_used, const FetchLayer& fl, const FetchScratch& fs, int k_gpu,
+                   bool cache, float decay, cudaStream_t s, bool ahead) {
+    fetch_resolve_kernel<<<1, 1024, 0, s>>>(ids, T, n_used, fl, fs, k_gpu, cache ? 1 : 0, decay, ahead ? 1 : 0);
+    check("fetch_resolve");
+}
+void fetch_copy(const FetchScratch& fs, size_t blob, int blocks, cudaStream_t s) {
+    fetch_copy_kernel<<<(unsigned) std::max(1, blocks), 256, 0, s>>>(fs.src, fs.dst, fs.nf, (blob + 15) / 16);
+    check("fetch_copy");
 }
 void moe_sum(const float* part, int T, int n_used, int n, const float* w, float* out, cudaStream_t s) {
     moe_sum_kernel<<<dim3((unsigned) ((n + 255) / 256), (unsigned) T), 256, 0, s>>>(part, n_used, n, w, out, 16);
@@ -2119,6 +2608,20 @@ void ix_score(const float* q, const float* wt, int T, int heads, int dim, const 
         ix_score_kernel<float><<<grid, 256, sh, s>>>(q, wt, heads, dim, pooled, pos, kpool, n_pool, score, ld);
     check("ix_score");
 }
+bool ix_score_wmma(const float* q, const float* wt, int T, int heads, int dim, const float* pooled, const int* pos,
+                   int kpool, int n_pool, float* score, size_t ld, cudaStream_t s, bool f16) {
+    // (HY4_IX_WMMA=0: ix_score's own kernel; the device as attention_wmma's)
+    static const bool off = std::getenv("HY4_IX_WMMA") != nullptr && std::atoi(std::getenv("HY4_IX_WMMA")) == 0;
+    if (off || T <= 0 || heads != 16 || dim != 128 || !attn_wmma_on()) return false;
+    if (n_pool <= 0) return true;
+    const dim3 grid((unsigned) ((n_pool + kIxPB - 1) / kIxPB), (unsigned) ((T + 7) / 8));
+    if (f16)
+        ix_score_wmma_kernel<__half><<<grid, 256, 0, s>>>(q, wt, T, (const __half*) pooled, pos, kpool, n_pool, score, ld);
+    else
+        ix_score_wmma_kernel<float><<<grid, 256, 0, s>>>(q, wt, T, pooled, pos, kpool, n_pool, score, ld);
+    check("ix_score_wmma");
+    return true;
+}
 void ix_reduce(const float* S, size_t ldS, const float* wt, int T, int heads, const int* pos, int kpool, int g0, int n,
                float* score, size_t ld, cudaStream_t s) {
     if (n <= 0 || T <= 0) return;
@@ -2163,7 +2666,7 @@ void kv_deq(const uint16_t* cache, int ring, int kv_lora, int n_rot, int k0, int
     kv_deq_kernel<<<(unsigned) ((total + 255) / 256), 256, 0, s>>>((const uint8_t*) cache, ring, kv_lora, n_rot,
                                                                  (int) kv_q8_row_bytes(kv_lora, n_rot), k0, n,
                                                                  (__half2*) dst, list, kpool, kend, hs.tag,
-                                                                 (const uint8_t*) hs.rows);
+                                                                 (const uint8_t*) hs.rows, hs.hidx);
     check("kv_deq");
 }
 void kv_gather(const uint16_t* cache, int ring, int row, int k0, int n, uint16_t* dst, cudaStream_t s, const int* list,
@@ -2173,7 +2676,7 @@ void kv_gather(const uint16_t* cache, int ring, int row, int k0, int n, uint16_t
     if (total == 0) return;
     kv_gather_kernel<<<(unsigned) ((total + 255) / 256), 256, 0, s>>>((const uint4*) cache, ring, row16, k0, n,
                                                                     (uint4*) dst, list, kpool, kend, hs.tag,
-                                                                    (const uint4*) hs.rows);
+                                                                    (const uint4*) hs.rows, hs.hidx);
     check("kv_gather");
 }
 void ix_union(const int* keys, int ldk, const int* nk, int T, int kpool, int n_pool, int* col, int* list, int* n,
@@ -2203,12 +2706,13 @@ __global__ void kv_union_claim_kernel(const int* __restrict__ keys, int ldk, con
 }
 __global__ void kv_union_fetch_kernel(const uint4* __restrict__ cache, int ring, int row16, const int* __restrict__ list,
                                       const int* __restrict__ count, uint4* __restrict__ dst,
-                                      const int* __restrict__ tag, const uint4* __restrict__ host) {
+                                      const int* __restrict__ tag, const uint4* __restrict__ host,
+                                      const int* __restrict__ hidx) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
     const int idx = (int) (i / row16), c = (int) (i % row16);
     if (idx >= *count) return;
     bool fh = false;
-    const size_t r = kv_src(list[idx], ring, tag, fh);
+    const size_t r = kv_src(list[idx], ring, tag, hidx, fh);
     dst[i] = (fh ? host : cache)[r * row16 + c];
 }
 __global__ void kv_union_remap_kernel(const int* __restrict__ keys, int ldk, const int* __restrict__ nk, int T,
@@ -2238,7 +2742,7 @@ void kv_pick_union(const uint16_t* cache, int ring, size_t row_bytes, const int*
     kv_union_claim_kernel<<<nb, 256, 0, s>>>(keys, ldk, nk, T, slot, count, list);
     kv_union_fetch_kernel<<<(unsigned) ((n * row16 + 255) / 256), 256, 0, s>>>((const uint4*) cache, ring, row16, list,
                                                                               count, (uint4*) dst, hs.tag,
-                                                                              (const uint4*) hs.rows);
+                                                                              (const uint4*) hs.rows, hs.hidx);
     kv_union_remap_kernel<<<nb, 256, 0, s>>>(keys, ldk, nk, T, slot, keys2);
     kv_union_reset_kernel<<<nb, 256, 0, s>>>(list, count, slot);
     check("kv_pick_union");
@@ -2254,8 +2758,61 @@ void kv_pick(const uint16_t* cache, int ring, size_t row_bytes, const int* keys,
     }
     const dim3 grid((unsigned) (((size_t) ldk * row16 + 255) / 256), (unsigned) T);
     kv_pick_kernel<<<grid, 256, 0, s>>>((const uint4*) cache, ring, row16, keys, ldk, nk, (uint4*) dst, hs.tag,
-                                        (const uint4*) hs.rows);
+                                        (const uint4*) hs.rows, hs.hidx);
     check("kv_pick");
+}
+namespace {
+__global__ void kv_need_kernel(const int* __restrict__ keys, int ldk, const int* __restrict__ nk, int T,
+                               const int* __restrict__ list, int kpool, int kend, int k0, int n, int ring,
+                               const int* __restrict__ tag, int* hidx, int hres, int* fgen, int gen, int* miss,
+                               int* mcount, int cap) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    int p;
+    if (keys) {
+        if (i >= (size_t) T * ldk || (int) (i % ldk) >= nk[i / ldk]) return;
+        p = keys[i];
+    } else if (list) {
+        if (i >= (size_t) n * kpool) return;
+        p = list[i / kpool] * kpool + (int) (i % kpool);
+        if (p >= kend) return;
+    } else {
+        if (i >= (size_t) n) return;
+        p = k0 + (int) i;
+    }
+    if (p < 0) return;
+    if (tag && tag[ring > 0 ? p % ring : p] == p) return;
+    const int h = hidx[p];
+    if (h >= hres) {
+        fgen[h - hres] = gen;
+        return;
+    }
+    if (h != -1) return;
+    if (atomicCAS(hidx + p, -1, -2) == -1) {
+        const int k = atomicAdd(mcount, 1);
+        if (k < cap) miss[k] = p;
+    }
+}
+__global__ void kv_hidx_kernel(const int* __restrict__ set, int n_set, const int* __restrict__ drop, int n_drop,
+                               int* hidx) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n_drop) atomicCAS(hidx + drop[2 * i], drop[2 * i + 1], -1);
+    if (i < n_set) hidx[set[2 * i]] = set[2 * i + 1];
+}
+}
+void kv_need(const int* keys, int ldk, const int* nk, int T, const int* list, int kpool, int kend, int k0, int n,
+             int ring, const KvHost& hs, int* fgen, int gen, int* miss, int* mcount, int cap, cudaStream_t s) {
+    const size_t total = keys ? (size_t) T * ldk : list ? (size_t) n * kpool : (size_t) n;
+    if (total == 0 || !hs.hidx) return;
+    kv_need_kernel<<<(unsigned) ((total + 255) / 256), 256, 0, s>>>(keys, ldk, nk, T, list, kpool, kend, k0, n, ring,
+                                                                   hs.tag, hs.hidx, hs.hres, fgen, gen, miss, mcount,
+                                                                   cap);
+    check("kv_need");
+}
+void kv_hidx(const int* set, int n_set, const int* drop, int n_drop, int* hidx, cudaStream_t s) {
+    const int n = std::max(n_set, n_drop);
+    if (n <= 0) return;
+    kv_hidx_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(set, n_set, drop, n_drop, hidx);
+    check("kv_hidx");
 }
 namespace {
 __global__ void bf16_f32_kernel(const uint16_t* __restrict__ src, float* __restrict__ dst, size_t n) {

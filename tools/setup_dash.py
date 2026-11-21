@@ -197,6 +197,9 @@ def tiers(m: dict, width: int):
     t, eng = m.get("tiers") or {}, m.get("engine") or {}
     n, h = t.get("now"), t.get("history") or {}
     if not n:
+        if eng.get("engine_kind") == "ik2":            # (maya-ik2 writes no STAT lines: nothing comes later)
+            return Text("Inkling 2 Mini's engine keeps its experts in VRAM where the card holds them; it reports no "
+                        "tiers.", f"italic {MUTED}")
         return Text("The engine tells where its experts live while it writes an answer.", f"italic {MUTED}")
     ds4 = eng.get("engine_kind") == "ds4"
     hy4 = eng.get("engine_kind") == "hy4"
@@ -380,7 +383,11 @@ def loading(w: LoadWatch, width: int):
     def gpu(k):
         return f"GPU {w.gpus[k]}" if k < n else f"part {k + 1}"
     now = [k for k in sorted(parts) if parts[k][0] < parts[k][1]]   # (the GPU warming now; before it starts: the next)
-    if not parts:
+    if getattr(w, "measuring", False):                  # (Hy4-Flash's first start on this PC, before it is ready)
+        left = getattr(w, "measure_left", None)
+        what = (f"measuring this PC once, {w.measuring if isinstance(w.measuring, str) else 'its choices'}" +
+                (f" (about {clock(left)} more)" if left else "") + " - the next starts skip this")
+    elif not parts:
         what = "reading the model's weights"
     elif len(parts) >= n and not now:
         what = "the engine's last checks - almost ready"

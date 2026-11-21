@@ -315,6 +315,98 @@ class Settings(unittest.TestCase):
             M.apply(bare, {"draft": "dspark"})
         self.assertEqual(M.quant_label(cfg, Path("maya-mm3.json")), "EXL3 3.5 bpw")
 
+    def ik2_cfg(self, **extra) -> Path:
+        """Inkling-2-Mini as the setup writes it (maya.write_config_ik2): its GGUF in the model's folder, the tokenizer
+        folder beside it (no drafter in the preview)."""
+        d = self.d / "models" / "Inkling-2-Mini"
+        (d / "maya-ik2" / "tokenizer").mkdir(parents=True, exist_ok=True)
+        (d / "Inkling-2-Mini-UD-Q4_K_XL.gguf").write_bytes(b"x" * 1000)
+        (d / "maya-ik2" / "sources.json").write_text(json.dumps(
+            {"files": [{"name": "Inkling-2-Mini-UD-Q4_K_XL.gguf", "size": 1000}]}))
+        args = ["--model", str(d / "Inkling-2-Mini-UD-Q4_K_XL.gguf"), "--max-context", "262144"]
+        cfg = {"exe": "/b/maya-ik2", "args": args, "tokenizer": str(d / "maya-ik2" / "tokenizer"),
+               "model_name": "inkling-2-mini", "gpu": [0], "env": {"IK2_KV": "fp8"},
+               "sampling": {"temperature": 1.0, "top_p": 1.0}, "reasoning_effort": "high",
+               "installer": {"family": "ik2", "quant": "unsloth UD-Q4_K_XL", "ik2_quant": "ud-q4_k_xl",
+                             "models_dir": str(self.d / "models"), "model_dir": str(d), "experimental": True}, **extra}
+        p = self.d / "maya-inkling-2-mini.json"
+        p.write_text(json.dumps(cfg))
+        return p
+
+    def test_ik2_read_and_written_with_its_own_flags(self):
+        """Inkling-2-Mini's preview on the Models page: its context, cache format and one GPU - maya-ik2's own flags
+        only; what it does not have yet (drafting, answers at once) said in plain words, and pictures where the setup
+        left out the image encoder."""
+        cards = mock.patch.object(M, "machine_gpus", return_value=[{"index": 0, "name": "RTX 3090", "vram_gb": 24.0},
+                                                                   {"index": 1, "name": "RTX 5090", "vram_gb": 31.5}])
+        cards.start()
+        self.addCleanup(cards.stop)
+        path = self.ik2_cfg()
+        cfg = M.read(path)
+        self.assertEqual(M.family(cfg), "ik2")
+        self.assertEqual(M.settings_of(cfg), {"context": 262144, "gpus": [0], "env": {}, "ablate": False,
+                                              "images": False, "kv": "fp8"})
+        self.assertEqual(M.choices(cfg)["draft"], ["none"])
+        self.assertFalse(M.choices(cfg)["images"])
+        self.assertEqual(M.quant_label(cfg, path), "unsloth UD-Q4_K_XL")
+        self.assertIsNone(M.missing(cfg))                                      # (its folder stands for the pack)
+        self.assertEqual(M.apply(cfg, {}), cfg)                                 # (a save that changes nothing)
+        self.assertEqual(M.apply(cfg, M.settings_of(cfg)), cfg)
+        self.assertEqual(M.apply(cfg, {"parallel": 1, "draft": "none"}), cfg)   # (their "off": nothing to say)
+        new = M.apply(cfg, {"context": 131072, "kv": "f16"})
+        self.assertEqual(M.flag(new["args"], "--max-context"), "131072")
+        self.assertEqual(new["env"], {"IK2_KV": "f16"})
+        self.assertEqual(M.apply(cfg, {"gpus": [1]})["gpu"], [1])
+        # maya-ik2 stops at a flag it does not know: only its own
+        self.assertEqual({x for x in M.apply(cfg, {"context": 65536})["args"] if x.startswith("--")},
+                         {"--model", "--max-context"})
+        for bad, why in (({"gpus": [0, 1]}, "one GPU"), ({"parallel": 2}, "one request at a time"),
+                         ({"draft": "dspark"}, "not offered in the Inkling 2 Mini preview"),
+                         ({"kv": "int8"}, "FP8 or F16"), ({"images": True}, "set up without its image encoder"),
+                         ({"reserve_mib": 512}, "not a setting")):
+            with self.assertRaises(ValueError, msg=str(bad)) as e:
+                M.apply(cfg, bad)
+            self.assertIn(why, str(e.exception))
+
+    def test_ik2_images_on_and_off(self):
+        """The setup's "vision" entry (maya-vision and the mmproj, no text model): Images off keeps it as "vision_off",
+        on puts it back; the engine's arguments are the same either way (the plan holds no room for pictures)."""
+        cards = mock.patch.object(M, "machine_gpus", return_value=[{"index": 0, "name": "RTX 3090", "vram_gb": 24.0}])
+        cards.start()
+        self.addCleanup(cards.stop)
+        path = self.ik2_cfg()
+        cfg = M.read(path)
+        v = {"exe": "/b/maya-vision", "mmproj": "/m/mmproj-BF16.gguf", "gpu": True}
+        cfg["vision"] = v
+        self.assertTrue(M.settings_of(cfg)["images"])
+        self.assertTrue(M.choices(cfg)["images"])
+        off = M.apply(cfg, {"images": False})
+        self.assertEqual((off.get("vision"), off["vision_off"], off["args"]), (None, v, cfg["args"]))
+        self.assertTrue(M.choices(off)["images"])                       # (it can be switched on again)
+        on = M.apply(off, {"images": True})
+        self.assertEqual((on["vision"], on.get("vision_off"), on["args"]), (v, None, cfg["args"]))
+        self.assertIn(Path(v["mmproj"]), M.vision_files(cfg))
+
+    def test_ik2_described_for_the_page(self):
+        cards = mock.patch.object(M, "machine_gpus", return_value=[{"index": 0, "name": "RTX 3090", "vram_gb": 24.0}])
+        cards.start()
+        self.addCleanup(cards.stop)
+        m = M.describe(self.ik2_cfg(env={"IK2_KV": "fp8", "MY_VAR": "1"}), None)
+        self.assertEqual((m["family"], m["model"], m["quant"], m["ok"]), ("ik2", "inkling-2-mini", "unsloth UD-Q4_K_XL", True))
+        self.assertEqual(m["settings"]["env"], {"MY_VAR": "1"})               # (IK2_KV: the KV cache setting)
+        self.assertEqual(m["settings"]["kv"], "fp8")
+        cfg = M.read(self.d / "maya-inkling-2-mini.json")
+        self.assertEqual(M.apply(cfg, {"env": {"IK2_KV": "f16"}})["env"]["IK2_KV"], "f16")   # (typed by hand)
+        self.assertEqual(m["contexts"], [32768, 65536, 131072, 262144])
+        self.assertEqual(m["context_range"]["tested"], 262144)
+        self.assertEqual(m["ik2_kv_bytes"], {"fp8": 16384, "f16": 32768})
+        self.assertEqual(m["ik2_fit"]["fp8"]["262144"], {"resident": True})
+        self.assertFalse(m["ik2_fit"]["f16"]["262144"]["resident"])
+        self.assertGreaterEqual(m["size"], 1000)                               # (the GGUF)
+        plan = M.delete_plan(self.d, self.d / "maya-inkling-2-mini.json")
+        self.assertTrue(plan["ok"], plan.get("why"))
+        self.assertEqual(Path(plan["folder"]).name, "Inkling-2-Mini")
+
     def test_hy4_read_and_written_with_its_own_flags(self):
         cards = mock.patch.object(M, "machine_gpus", return_value=[{"index": i, "name": "V100", "vram_gb": 16.0}
                                                                    for i in range(4)])
