@@ -1713,6 +1713,7 @@ void mv_launch(int f, const BfJobs& J, int nj, int max_n, bool vec, cudaStream_t
         static const int tc = [] {
             const char* v = std::getenv("MAYA_DS4_Q8MV_TC");
             if (v == nullptr) v = std::getenv("DS4_Q8MV_TC");
+            if (v == nullptr) v = std::getenv("MAYA_MM3_Q8MV_TC");
             if (v == nullptr) v = std::getenv("STRATA_MM3_Q8MV_TC");
             if (v == nullptr) v = std::getenv("MM3_Q8MV_TC");
             return v != nullptr ? std::atoi(v) : 0;
@@ -1720,6 +1721,7 @@ void mv_launch(int f, const BfJobs& J, int nj, int max_n, bool vec, cudaStream_t
         static const int tc_stg = [] {
             const char* v = std::getenv("MAYA_DS4_TC_STAGES");
             if (v == nullptr) v = std::getenv("DS4_Q8MV_TC_STAGES");
+            if (v == nullptr) v = std::getenv("MAYA_MM3_Q8MV_TC_STAGES");
             if (v == nullptr) v = std::getenv("STRATA_MM3_Q8MV_TC_STAGES");
             if (v == nullptr) v = std::getenv("MM3_Q8MV_TC_STAGES");
             return v != nullptr ? std::atoi(v) : 3;
