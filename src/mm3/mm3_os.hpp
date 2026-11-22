@@ -156,7 +156,7 @@ inline size_t populate_mapped(const void* p, size_t n, const std::atomic<bool>& 
         sys::prefetch({{(const void*) c, m}});
 #endif
         volatile uint8_t sink = 0;
-        for (size_t b = 0; b < m; b += pg) sink ^= c[b];
+        for (size_t b = 0; b < m; b += pg) sink = static_cast<uint8_t>(sink ^ c[b]);
         (void) sink;
     }
     if (c >= end) return n;

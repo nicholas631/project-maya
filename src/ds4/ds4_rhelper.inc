@@ -404,7 +404,7 @@
             return a.first != c.first ? a.first > c.first : a.second < c.second;
         });
         uint8_t* take = rh_base + rh_off_ptake;
-        std::memset(take, 0, (size_t) ne);
+        if (ne > 0) std::memset(take, 0, (size_t) ne);
         const long long cap = (long long) (rh_pshare * (double) T * (double) L0.k_exp);
         long long rows = 0;
         for (const auto& o : own) {
