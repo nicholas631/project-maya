@@ -879,7 +879,7 @@ __global__ void __launch_bounds__(128) sparse_attn_kernel(const float* q, const 
         }
         return;
     }
-    if constexpr (!vrot) {
+    if (!vrot) {
 #pragma unroll
         for (int h = 0; h < kG; ++h)
             out[((size_t) t * Hq + g * kG + h) * 128 + tid] = lrow[h] > 0.0f ? acc[h] / lrow[h] : 0.0f;
@@ -1027,7 +1027,7 @@ __global__ void __launch_bounds__(kWideNT) sparse_attn_w_kernel(const float* q, 
         }
         return;
     }
-    if constexpr (!vrot) {
+    if (!vrot) {
 #pragma unroll
         for (int i = 0; i < HV; ++i) {
             const int h = hq * HV + i;
